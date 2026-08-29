@@ -1,0 +1,107 @@
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import yt_dlp
+
+app = FastAPI(title="Social Media Downloader API")
+
+# WAJIB: tanpa ini, fetch() dari browser (Blogspot) selalu diblok CORS
+# meskipun API-nya hidup dan responsnya benar.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],      # ganti ke ["https://namablog.blogspot.com"] kalau mau dibatasi
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+ALLOWED_QUALITIES = [144, 240, 360, 480, 720, 1080, 1440, 2160]
+
+
+def build_ydl_opts(quality: int) -> dict:
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "format": f"best[height<={quality}]/best",
+        "noplaylist": True,
+        "socket_timeout": 20,
+        # membantu mengurangi "Sign in to confirm you're not a bot" dari YouTube
+        # di sebagian kasus — bukan jaminan 100%, tapi cukup membantu.
+        "extractor_args": {
+            "youtube": {"player_client": ["android", "web"]},
+        },
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+        },
+    }
+
+
+def extract_video_url(info: dict, quality: int) -> str | None:
+    video_url = info.get("url")
+    if video_url:
+        return video_url
+
+    candidates = [
+        f for f in info.get("formats", [])
+        if f.get("url") and f.get("vcodec") != "none" and (f.get("height") or 0) <= quality
+    ]
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda f: f.get("height") or 0)
+    return best.get("url")
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": "yt-dlp API is running. Support TikTok, YouTube, Instagram, Facebook, Twitter, dan 1000+ platform lainnya.",
+        "endpoints": ["/download?url=...&quality=720", "/health"],
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/download")
+async def download_video(
+    url: str = Query(..., description="Link video dari TikTok/YouTube/Instagram/FB/dll"),
+    quality: int = Query(720, description="Tinggi video maksimum, mis. 360/720/1080"),
+):
+    if quality not in ALLOWED_QUALITIES:
+        quality = min(ALLOWED_QUALITIES, key=lambda q: abs(q - quality))
+
+    ydl_opts = build_ydl_opts(quality)
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        raise HTTPException(status_code=422, detail=f"Gagal memproses link: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Terjadi kesalahan server: {str(e)}")
+
+    video_url = extract_video_url(info, quality)
+    if not video_url:
+        raise HTTPException(status_code=404, detail="Tidak ada format video yang cocok ditemukan untuk kualitas ini.")
+
+    return {
+        "status": "success",
+        "title": info.get("title", "Video"),
+        "video_url": video_url,
+        "thumbnail": info.get("thumbnail", ""),
+        "duration": info.get("duration", 0),
+        "platform": info.get("extractor", "unknown"),
+        "quality": quality,
+    }
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"status": "error", "message": exc.detail},
+    )
