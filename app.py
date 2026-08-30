@@ -183,6 +183,26 @@ def build_download_url(source_url: str, title: str, quality: int) -> str | None:
     )
 
 
+def build_audio_download_url(source_query: str, title: str) -> str | None:
+    if not PUBLIC_DOMAIN:
+        return None
+    filename = sanitize_filename(title) + ".mp3"
+    return (
+        f"https://{PUBLIC_DOMAIN}/proxy-audio"
+        f"?source={quote(source_query, safe='')}&filename={quote(filename)}"
+    )
+
+
+def resolve_spotify_title(spotify_url: str) -> str | None:
+    """Ambil judul lagu dari link Spotify lewat oEmbed (Spotify sendiri
+    memproteksi audionya/DRM, jadi nggak bisa diunduh langsung dari sana)."""
+    try:
+        oembed = requests.get("https://open.spotify.com/oembed", params={"url": spotify_url}, timeout=10).json()
+        return (oembed.get("title") or "").strip() or None
+    except Exception:
+        return None
+
+
 def fetch_video_info(url: str, quality: int = 720):
     if quality not in ALLOWED_QUALITIES:
         quality = min(ALLOWED_QUALITIES, key=lambda q: abs(q - quality))
@@ -198,6 +218,13 @@ def fetch_video_info(url: str, quality: int = 720):
     if not video_url:
         return None, "Tidak ada format video yang cocok ditemukan untuk kualitas ini."
 
+    duration = info.get("duration", 0)
+    if duration and duration > MAX_DURATION_MINUTES * 60:
+        return None, (
+            f"Video ini berdurasi {format_duration(duration)}, melebihi batas "
+            f"{MAX_DURATION_MINUTES} menit yang ditetapkan biar server nggak kebebanan."
+        )
+
     title = info.get("title", "Video")
     platform = info.get("extractor", "unknown")
     return {
@@ -206,9 +233,69 @@ def fetch_video_info(url: str, quality: int = 720):
         "video_url": video_url,
         "download_url": build_download_url(url, title, quality),
         "thumbnail": info.get("thumbnail", ""),
-        "duration": info.get("duration", 0),
+        "duration": duration,
         "platform": platform,
         "quality": quality,
+    }, None
+
+
+def fetch_audio_info(url: str):
+    """Ambil info audio (dipakai endpoint web /download-audio). Mendukung link
+    Spotify juga: dicari otomatis versi audionya di YouTube via judul oEmbed."""
+    display_title = None
+    platform = "audio"
+
+    if is_spotify(url):
+        track_title = resolve_spotify_title(url)
+        if not track_title:
+            return None, "Gagal membaca info lagu dari link Spotify ini. Pastikan link-nya valid & publik."
+        search_query = f"ytsearch1:{track_title} audio"
+        display_title = track_title
+        platform = "spotify (via youtube)"
+    else:
+        search_query = url
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "socket_timeout": 20,
+        "http_headers": {"User-Agent": USER_AGENT},
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(search_query, download=False)
+            if info.get("entries"):
+                info = info["entries"][0]
+    except yt_dlp.utils.DownloadError as e:
+        return None, f"Gagal memproses link: {e}"
+    except Exception as e:
+        return None, f"Terjadi kesalahan server: {e}"
+
+    duration = info.get("duration", 0)
+    if duration and duration > MAX_DURATION_MINUTES * 60:
+        return None, (
+            f"Audio ini berdurasi {format_duration(duration)}, melebihi batas "
+            f"{MAX_DURATION_MINUTES} menit yang ditetapkan biar server nggak kebebanan."
+        )
+
+    title = display_title or info.get("title", "Audio")
+    audio_url = info.get("url")
+    if not audio_url:
+        candidates = [f for f in info.get("formats", []) if f.get("url") and f.get("acodec") != "none"]
+        audio_url = max(candidates, key=lambda f: f.get("abr") or 0).get("url") if candidates else None
+    if not audio_url:
+        return None, "Tidak ada format audio yang cocok ditemukan."
+
+    return {
+        "status": "success",
+        "title": title,
+        "audio_url": audio_url,
+        "download_url": build_audio_download_url(search_query, title),
+        "thumbnail": info.get("thumbnail", ""),
+        "duration": duration,
+        "platform": platform if not is_spotify(url) else platform,
     }, None
 
 
@@ -400,8 +487,15 @@ def make_progress_hook(chat_id, message_id, base_text: str):
 @app.get("/")
 async def root():
     return {
-        "message": "yt-dlp API is running. Support TikTok, YouTube, Instagram, Facebook, Twitter, Spotify(via YouTube), dan 1000+ platform lainnya.",
-        "endpoints": ["/download?url=...&quality=720", "/proxy?source=...&quality=720", "/health", "/telegram-webhook (POST)"],
+        "message": "yt-dlp API is running. Support TikTok, YouTube, Instagram, Facebook, Twitter, Vimeo, Spotify(via YouTube), dan 1000+ platform lainnya.",
+        "endpoints": [
+            "/download?url=...&quality=720",
+            "/proxy?source=...&quality=720",
+            "/download-audio?url=...",
+            "/proxy-audio?source=...",
+            "/health",
+            "/telegram-webhook (POST)",
+        ],
     }
 
 
@@ -435,6 +529,37 @@ async def proxy_download(request: Request, source: str = Query(...), quality: in
         raise HTTPException(status_code=502, detail=f"Gagal mengunduh video: {e}")
     return FileResponse(
         filepath, media_type="video/mp4", filename=filename,
+        background=BackgroundTask(lambda: shutil.rmtree(tmp_dir, ignore_errors=True)),
+    )
+
+
+@app.get("/download-audio")
+async def download_audio(request: Request, url: str = Query(...)):
+    """Versi web dari fitur '🎵 Audio (MP3)' bot Telegram. Mendukung link biasa
+    (TikTok/YouTube/IG/FB/Twitter/Vimeo) maupun Spotify (dicari otomatis di YouTube)."""
+    check_rate_limit(request)
+    result, error = fetch_audio_info(url)
+    if error:
+        send_telegram_notification(f"❌ *Gagal Memproses Link Audio!*\n• URL: {url}\n• Error: `{error}`")
+        status_code = 404 if "Tidak ada format" in error else 422
+        raise HTTPException(status_code=status_code, detail=error)
+
+    send_telegram_notification(
+        f"🎵 *Unduhan Audio Berhasil!*\n• Judul: {result['title']}\n"
+        f"• Platform: {result['platform']}\n• URL: {url}"
+    )
+    return result
+
+
+@app.get("/proxy-audio")
+async def proxy_download_audio(request: Request, source: str = Query(...), filename: str = Query("audio.mp3")):
+    check_rate_limit(request)
+    try:
+        filepath, tmp_dir = download_audio_file(source)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Gagal mengunduh audio: {e}")
+    return FileResponse(
+        filepath, media_type="audio/mpeg", filename=filename,
         background=BackgroundTask(lambda: shutil.rmtree(tmp_dir, ignore_errors=True)),
     )
 
