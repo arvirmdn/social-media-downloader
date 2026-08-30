@@ -27,6 +27,21 @@ Contoh respons gagal:
 { "status": "error", "message": "Gagal memproses link: ..." }
 ```
 
+## Notifikasi Telegram (opsional)
+
+API ini bisa mengirim notifikasi ke Telegram setiap ada percobaan download
+(sukses/gagal). Supaya aktif, set dua Environment Variables di Railway
+(Settings > Variables) — **jangan pernah ditulis langsung di `app.py`**:
+
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+Kalau salah satu tidak diset, notifikasi otomatis dilewati (tidak dianggap error).
+
+⚠️ **Keamanan**: kalau token bot pernah ke-commit langsung di kode (bukan lewat
+env var) dan repo-nya publik, anggap token itu bocor — generate ulang lewat
+@BotFather di Telegram (`/revoke` atau `/token`) sesegera mungkin.
+
 ## Deploy
 
 Bisa dideploy ke Railway, Render, atau Koyeb — semuanya mendeteksi `requirements.txt`
