@@ -43,6 +43,11 @@ Backend FastAPI + yt-dlp untuk web downloader dan bot Telegram dengan **membersh
 | `/help` | Lihat bantuan (sama seperti `/start`) |
 | Kirim link video | Downloader akan minta pilih kualitas |
 
+### User Commands (Semua Orang)
+| Command | Fungsi |
+|---------|--------|
+| `/myid` | Lihat Telegram ID sendiri (tidak perlu bot lain) |
+
 ### Owner/Admin Commands (Khusus Pemilik Bot)
 | Command | Fungsi |
 |---------|--------|
@@ -51,6 +56,8 @@ Backend FastAPI + yt-dlp untuk web downloader dan bot Telegram dengan **membersh
 | `/addmember <user_id>` | Add user sebagai member |
 | `/removemember <user_id>` | Remove user dari member |
 | `/members` | Lihat daftar semua members |
+| `/stats` | Lihat statistik bot (jumlah member, link diproses) |
+| `/broadcast <pesan>` | Kirim pengumuman ke semua member |
 
 ---
 
@@ -120,8 +127,11 @@ Kalau orang yang belum di-add coba kirim link:
 
 **OPTIONAL:**
 - `MAX_DURATION_MINUTES` (default `15`) — batas durasi video yang boleh diproses
-- `APPROVED_MEMBERS` — initial member list (format: `"123456,789012,345678"`) — komma-separated user IDs
+- `APPROVED_MEMBERS` — initial member list (format: `"123456,789012,345678"`) — komma-separated user IDs. Sekarang cuma dipakai untuk **migrasi sekali** ke database; setelahnya member disimpan permanen di DB, bukan lagi bergantung ke env var ini.
   - Note: `OWNER_USER_ID` otomatis di-add, jadi nggak perlu dimasukkan di sini
+- `DB_PATH` (default `bot_data.db`) — lokasi file database SQLite untuk member list & statistik.
+  - ⚠️ Filesystem Railway itu ephemeral (hilang saat redeploy). Untuk member list yang **benar-benar** persisten lintas redeploy, attach **Railway Volume** dan arahkan `DB_PATH` ke folder di dalam volume tsb (misal `DB_PATH=/data/bot_data.db`).
+- `ALLOWED_WEB_ORIGINS` — comma-separated domain web yang boleh akses endpoint publik (`/download`, `/proxy`, dll), contoh: `ALLOWED_WEB_ORIGINS=https://arvirmdn.github.io`. Kalau kosong, pengecekan ini di-skip (semua origin boleh, seperti sebelumnya).
 
 ---
 
@@ -175,18 +185,20 @@ Kalau berhasil, return: `{"ok": true, "result": true}`
 Ya, itu benar. `/menu` hanya bisa diakses owner. User biasa hanya bisa pakai downloader features.
 
 ### Member list hilang saat restart
-1. Set `APPROVED_MEMBERS` env var dengan initial list (comma-separated)
-   Contoh: `APPROVED_MEMBERS=111111,222222,333333`
-2. Atau: add members lagi via `/addmember` command
+Sejak update terbaru, member list disimpan di database SQLite (`DB_PATH`), jadi **bertahan** untuk restart proses biasa. Kalau masih hilang juga:
+1. Pastikan `DB_PATH` menunjuk ke lokasi yang sama tiap kali deploy (default `bot_data.db` di root project).
+2. Kalau kamu redeploy (bukan cuma restart), Railway bisa mengganti filesystem — attach **Railway Volume** dan arahkan `DB_PATH` ke folder di dalamnya supaya benar-benar permanen.
+3. Sebagai fallback cepat, set `APPROVED_MEMBERS` env var (comma-separated) — otomatis dimigrasikan ke database saat startup.
 
 ---
 
 ## Catatan Teknis
 
 - **ffmpeg wajib ada di server** — diatur lewat `nixpacks.toml` dan `railway.toml`
-- **Member list in-memory** — kalau mau persistent across restart, perlu database (Redis/PostgreSQL)
+- **Member list disimpan di SQLite** (`DB_PATH`, default `bot_data.db`) — bertahan lintas restart proses biasa. Untuk persisten lintas redeploy, attach Railway Volume (lihat bagian Environment Variables).
+- **Endpoint publik (`/download`, `/proxy`, dll) bisa dibatasi ke domain web sendiri** lewat `ALLOWED_WEB_ORIGINS` — kalau tidak diset, tetap terbuka seperti sebelumnya.
 - Fitur Spotify tergantung pencarian YouTube — kualitas tergantung ada versi di YouTube atau nggak
-- Pilihan kualitas hilang kalau server restart (need database)
+- Pilihan kualitas video (`PENDING`) tetap in-memory dan kedaluwarsa otomatis setelah 15 menit tidak dipilih — kirim ulang linknya kalau expired.
 - `yt-dlp` tidak dikunci versi, selalu dapat versi terbaru saat redeploy
 
 ---

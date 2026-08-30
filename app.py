@@ -8,6 +8,7 @@ import os
 import re
 import glob
 import shutil
+import sqlite3
 import tempfile
 import time
 import uuid
@@ -32,17 +33,102 @@ TELEGRAM_MAX_UPLOAD_MB = 50  # batas resmi Telegram Bot API untuk upload langsun
 MAX_LINKS_PER_MESSAGE = 5    # batas link sekaligus dalam 1 pesan
 MAX_DURATION_MINUTES = int(os.getenv("MAX_DURATION_MINUTES", "15"))
 
-# Member list (in-memory, backup di env var APPROVED_MEMBERS)
-# Format di env var: "123456,789012,345678" (comma-separated user IDs)
-APPROVED_MEMBERS = set()
+# ---------- Member storage (SQLite, persisten) ----------
+# Sebelumnya member list cuma disimpan di memory (dict/set Python biasa),
+# jadi hilang total tiap kali server restart/redeploy. Sekarang disimpan di
+# file SQLite supaya bertahan selama proses restart biasa.
+#
+# CATATAN PENTING (Railway): filesystem Railway itu EPHEMERAL — file akan
+# ikut hilang kalau kamu redeploy / pindah instance, KECUALI kamu attach
+# "Volume" di Railway dan arahkan DB_PATH ke path di dalam volume itu
+# (Settings > Volumes > mount ke folder, lalu set env var DB_PATH ke
+# folder tsb, misal DB_PATH=/data/bot_data.db). Tanpa volume, ini tetap
+# jauh lebih baik daripada in-memory murni (survive restart proses biasa),
+# tapi belum 100% persisten lintas redeploy.
+DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS members (user_id INTEGER PRIMARY KEY)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS stats (key TEXT PRIMARY KEY, value INTEGER NOT NULL DEFAULT 0)"
+    )
+    return conn
+
+
+def load_members_from_db() -> set:
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT user_id FROM members").fetchall()
+        return set(r[0] for r in rows)
+    finally:
+        conn.close()
+
+
+def db_add_member(user_id: int):
+    conn = get_db()
+    try:
+        conn.execute("INSERT OR IGNORE INTO members (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_remove_member(user_id: int):
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM members WHERE user_id = ?", (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_increment_stat(key: str, by: int = 1):
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO stats (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = value + excluded.value",
+            (key, by),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_get_stat(key: str) -> int:
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT value FROM stats WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else 0
+    finally:
+        conn.close()
+
+
+# Member list di-load dari DB saat startup, lalu dipegang di memory (set) biar
+# pengecekan is_member() tetap cepat — setiap perubahan (add/remove) langsung
+# ditulis ke DB juga lewat db_add_member()/db_remove_member().
+APPROVED_MEMBERS = load_members_from_db()
+
+# Migrasi dari env var APPROVED_MEMBERS lama (kalau masih dipakai) ke DB,
+# supaya member yang sebelumnya cuma "hidup" di env var ikut tersimpan permanen.
 if os.getenv("APPROVED_MEMBERS"):
     try:
-        APPROVED_MEMBERS = set(int(uid.strip()) for uid in os.getenv("APPROVED_MEMBERS", "").split(",") if uid.strip())
+        legacy_ids = set(int(uid.strip()) for uid in os.getenv("APPROVED_MEMBERS", "").split(",") if uid.strip())
+        for uid in legacy_ids:
+            if uid not in APPROVED_MEMBERS:
+                db_add_member(uid)
+        APPROVED_MEMBERS |= legacy_ids
     except ValueError:
         pass
 
 # Add owner ke approved members
 if OWNER_USER_ID > 0:
+    if OWNER_USER_ID not in APPROVED_MEMBERS:
+        db_add_member(OWNER_USER_ID)
     APPROVED_MEMBERS.add(OWNER_USER_ID)  # pemilik otomatis approved
     print(f"✅ Owner (ID: {OWNER_USER_ID}) added to approved members")
 else:
@@ -50,7 +136,7 @@ else:
     print("   Membership system DISABLED untuk sekarang (semua user bisa akses)")
 
 if APPROVED_MEMBERS:
-    print(f"✅ Approved members: {sorted(APPROVED_MEMBERS)}")
+    print(f"✅ Approved members ({len(APPROVED_MEMBERS)}, dari DB: {DB_PATH}): {sorted(APPROVED_MEMBERS)}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -98,9 +184,71 @@ def check_rate_limit(request: Request):
             if not _rate_limit_hits[ip]:
                 del _rate_limit_hits[ip]
 
-# Link yang lagi nunggu dipilih kualitasnya (in-memory — hilang kalau server
-# redeploy/restart pas user lagi mikir, tinggal kirim ulang linknya).
-PENDING: dict[str, str] = {}
+
+# ---------- Proteksi Origin untuk endpoint publik (/download, /proxy, dst) ----------
+# Sebelumnya endpoint ini bisa dipanggil siapa saja yang tahu domain Railway-nya,
+# langsung, tanpa lewat web kita sama sekali (cuma dibatasi rate-limit per-IP).
+# Sekarang ditambah pengecekan header Origin/Referer: request HARUS datang dari
+# domain web resmi kita. Ini BUKAN proteksi sempurna (header bisa dipalsukan
+# lewat curl/Postman), tapi cukup untuk mencegah orang random/bot nemenin
+# nyedot API kita langsung dari browser/script kasual, dan tetap gratis dipakai
+# dari web kita sendiri.
+#
+# Set env var ALLOWED_WEB_ORIGINS di Railway, comma-separated, contoh:
+#   ALLOWED_WEB_ORIGINS=https://arvirmdn.github.io,https://arvirmdn.com
+# Kalau env var ini KOSONG, pengecekan di-skip (biar tidak tiba-tiba mem-block
+# semua orang kalau lupa di-set) — tapi akan muncul warning di log saat startup.
+ALLOWED_WEB_ORIGINS = set(
+    o.strip().rstrip("/") for o in os.getenv("ALLOWED_WEB_ORIGINS", "").split(",") if o.strip()
+)
+if ALLOWED_WEB_ORIGINS:
+    print(f"✅ ALLOWED_WEB_ORIGINS aktif: {sorted(ALLOWED_WEB_ORIGINS)}")
+else:
+    print("⚠️  WARNING: ALLOWED_WEB_ORIGINS belum di-set — endpoint publik (/download, /proxy, dll) "
+          "masih bisa diakses dari domain manapun. Set env var ini di Railway untuk membatasinya ke web kamu sendiri.")
+
+
+def check_web_origin(request: Request):
+    """Raise HTTPException 403 kalau request bukan dari domain web yang diizinkan.
+    Di-skip total kalau ALLOWED_WEB_ORIGINS belum di-set (mode kompatibel/lama)."""
+    if not ALLOWED_WEB_ORIGINS:
+        return
+
+    origin = (request.headers.get("origin") or "").rstrip("/")
+    referer = request.headers.get("referer") or ""
+
+    if origin and origin in ALLOWED_WEB_ORIGINS:
+        return
+    if referer and any(referer.startswith(o + "/") or referer.rstrip("/") == o for o in ALLOWED_WEB_ORIGINS):
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail="Akses ditolak: endpoint ini hanya bisa dipanggil dari web resminya.",
+    )
+
+# Link yang lagi nunggu dipilih kualitasnya. Disimpan sebagai (url, created_at)
+# supaya entry basi (user tidak pernah klik tombol kualitas) bisa dibersihkan —
+# tanpa ini dict-nya cuma membesar terus selama server hidup (memory leak kecil).
+PENDING: dict[str, tuple[str, float]] = {}
+PENDING_TTL_SECONDS = 15 * 60  # 15 menit
+
+
+def pending_add(url: str) -> str:
+    """Simpan link ke PENDING, sekalian buang entry lama yang sudah kedaluwarsa."""
+    now = time.time()
+    expired = [k for k, (_, ts) in PENDING.items() if now - ts > PENDING_TTL_SECONDS]
+    for k in expired:
+        PENDING.pop(k, None)
+
+    req_id = uuid.uuid4().hex[:10]
+    PENDING[req_id] = (url, now)
+    return req_id
+
+
+def pending_pop(req_id: str) -> str | None:
+    entry = PENDING.pop(req_id, None)
+    return entry[0] if entry else None
 
 
 def is_member(user_id: int) -> bool:
@@ -112,13 +260,15 @@ def is_member(user_id: int) -> bool:
 
 
 def add_member(user_id: int):
-    """Add user ke approved members list."""
+    """Add user ke approved members list (memory + DB persisten)."""
     APPROVED_MEMBERS.add(user_id)
+    db_add_member(user_id)
 
 
 def remove_member(user_id: int):
-    """Remove user dari approved members list."""
+    """Remove user dari approved members list (memory + DB persisten)."""
     APPROVED_MEMBERS.discard(user_id)
+    db_remove_member(user_id)
 
 
 # ---------- util ----------
@@ -508,6 +658,7 @@ async def health():
 
 @app.get("/download")
 async def download_video(request: Request, url: str = Query(...), quality: int = Query(720)):
+    check_web_origin(request)
     check_rate_limit(request)
     result, error = fetch_video_info(url, quality)
     if error:
@@ -524,6 +675,7 @@ async def download_video(request: Request, url: str = Query(...), quality: int =
 
 @app.get("/proxy")
 async def proxy_download(request: Request, source: str = Query(...), quality: int = Query(720), filename: str = Query("video.mp4")):
+    check_web_origin(request)
     check_rate_limit(request)
     try:
         filepath, tmp_dir = download_video_file(source, quality)
@@ -539,6 +691,7 @@ async def proxy_download(request: Request, source: str = Query(...), quality: in
 async def download_audio(request: Request, url: str = Query(...)):
     """Versi web dari fitur '🎵 Audio (MP3)' bot Telegram. Mendukung link biasa
     (TikTok/YouTube/IG/FB/Twitter/Vimeo) maupun Spotify (dicari otomatis di YouTube)."""
+    check_web_origin(request)
     check_rate_limit(request)
     result, error = fetch_audio_info(url)
     if error:
@@ -555,6 +708,7 @@ async def download_audio(request: Request, url: str = Query(...)):
 
 @app.get("/proxy-audio")
 async def proxy_download_audio(request: Request, source: str = Query(...), filename: str = Query("audio.mp3")):
+    check_web_origin(request)
     check_rate_limit(request)
     try:
         filepath, tmp_dir = download_audio_file(source)
@@ -702,6 +856,9 @@ def process_and_deliver(chat_id, url: str, quality: int, audio_only: bool, statu
 
 
 def process_link(chat_id, url: str, quality: int = 720, audio_only: bool = False, status_message_id: int | None = None):
+    # Dihitung untuk /stats. Ini menghitung "link yang diproses" (bukan jaminan
+    # berhasil terkirim), tapi cukup untuk gambaran kasar seberapa aktif bot dipakai.
+    db_increment_stat("bot_links_processed")
     if is_spotify(url):
         process_spotify(chat_id, url, status_message_id)
     else:
@@ -779,6 +936,51 @@ def handle_incoming_message(message: dict):
         send_bot_message(chat_id, f"📋 *Member List ({len(APPROVED_MEMBERS)}):*\n{members_str}")
         return
 
+    if text == "/stats":
+        if OWNER_USER_ID == 0:
+            send_bot_message(chat_id, "❌ Membership system belum aktif. Set `OWNER_USER_ID` di Railway Settings dulu.")
+            return
+        if user_id != OWNER_USER_ID:
+            send_bot_message(chat_id, "❌ Hanya pemilik bot yang bisa lihat statistik.")
+            return
+        links_processed = db_get_stat("bot_links_processed")
+        send_bot_message(
+            chat_id,
+            "📊 *Statistik Bot*\n\n"
+            f"👥 Total member: `{len(APPROVED_MEMBERS)}`\n"
+            f"🔗 Total link diproses: `{links_processed}`\n"
+            f"⏳ Link pending pilih kualitas: `{len(PENDING)}`"
+        )
+        return
+
+    if text.startswith("/broadcast "):
+        if OWNER_USER_ID == 0:
+            send_bot_message(chat_id, "❌ Membership system belum aktif. Set `OWNER_USER_ID` di Railway Settings dulu.")
+            return
+        if user_id != OWNER_USER_ID:
+            send_bot_message(chat_id, "❌ Hanya pemilik bot yang bisa broadcast.")
+            return
+        broadcast_text = text[len("/broadcast "):].strip()
+        if not broadcast_text:
+            send_bot_message(chat_id, "Format: `/broadcast <pesan>`")
+            return
+        sent, failed = 0, 0
+        for member_id in sorted(APPROVED_MEMBERS):
+            if member_id == OWNER_USER_ID:
+                continue
+            msg_id = send_bot_message(member_id, f"📢 *Pengumuman*\n\n{broadcast_text}")
+            if msg_id:
+                sent += 1
+            else:
+                failed += 1
+        send_bot_message(chat_id, f"✅ Broadcast terkirim ke `{sent}` member" + (f", gagal ke `{failed}` member." if failed else "."))
+        return
+
+    # --- USER COMMANDS (tersedia untuk semua orang, bukan cuma member) ---
+    if text == "/myid":
+        send_bot_message(chat_id, f"🆔 Telegram ID kamu: `{user_id}`")
+        return
+
     # --- USER COMMANDS ---
     if text in ("/start", "/help"):
         # Kalau OWNER_USER_ID belum di-set, tampilkan warning ke owner
@@ -831,8 +1033,7 @@ def handle_incoming_message(message: dict):
         if is_spotify(url):
             process_link(chat_id, url)
             return
-        req_id = uuid.uuid4().hex[:10]
-        PENDING[req_id] = url
+        req_id = pending_add(url)
         keyboard = {
             "inline_keyboard": [
                 [
@@ -897,7 +1098,7 @@ def handle_callback_query(callback_query: dict):
         return
 
     _, req_id, choice = parts
-    url = PENDING.pop(req_id, None)
+    url = pending_pop(req_id)
     answer_callback(callback_id)
 
     if not url:
