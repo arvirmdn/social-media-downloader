@@ -553,6 +553,24 @@ def handle_incoming_message(message: dict):
     text = (message.get("text") or "").strip()
 
     # --- ADMIN COMMANDS ---
+    if text in ("/menu", "/adminmenu"):
+        if OWNER_USER_ID == 0:
+            send_bot_message(chat_id, "❌ Membership system belum aktif. Set `OWNER_USER_ID` di Railway Settings dulu.")
+            return
+        if user_id != OWNER_USER_ID:
+            send_bot_message(chat_id, "❌ Hanya pemilik bot yang bisa akses admin menu.")
+            return
+        
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "📋 Lihat Members", "callback_data": "admin|members"}],
+                [{"text": "➕ Add Member", "callback_data": "admin|addmember"}],
+                [{"text": "➖ Remove Member", "callback_data": "admin|removemember"}],
+            ]
+        }
+        send_bot_message(chat_id, "⚙️ *Admin Menu*\n\nPilih aksi yang ingin dilakukan:", reply_markup=keyboard)
+        return
+
     if text.startswith("/addmember "):
         if OWNER_USER_ID == 0:
             send_bot_message(chat_id, "❌ Membership system belum aktif. Set `OWNER_USER_ID` di Railway Settings dulu.")
@@ -678,8 +696,41 @@ def handle_callback_query(callback_query: dict):
     chat_id = callback_query["message"]["chat"]["id"]
     message_id = callback_query["message"]["message_id"]
     data = callback_query.get("data", "")
+    user_id = callback_query.get("from", {}).get("id")
 
     parts = data.split("|")
+    
+    # --- ADMIN CALLBACKS ---
+    if len(parts) >= 2 and parts[0] == "admin":
+        answer_callback(callback_id)
+        
+        if user_id != OWNER_USER_ID:
+            send_bot_message(chat_id, "❌ Hanya owner yang bisa pakai ini.")
+            return
+        
+        action = parts[1]
+        
+        if action == "members":
+            if not APPROVED_MEMBERS:
+                edit_bot_message(chat_id, message_id, "📋 Member list kosong.")
+            else:
+                members_str = "\n".join(f"• `{uid}`" for uid in sorted(APPROVED_MEMBERS))
+                edit_bot_message(chat_id, message_id, f"📋 *Member List ({len(APPROVED_MEMBERS)}):*\n{members_str}")
+            return
+        
+        elif action == "addmember":
+            edit_bot_message(chat_id, message_id, "📝 *Tambah Member*\n\nReply dengan format:\n`/addmember <user_id>`\n\nContoh: `/addmember 123456789`")
+            return
+        
+        elif action == "removemember":
+            if not APPROVED_MEMBERS or len(APPROVED_MEMBERS) == 1:
+                edit_bot_message(chat_id, message_id, "❌ Nggak ada member yang bisa di-remove.")
+            else:
+                members_str = "\n".join(f"• `{uid}`" for uid in sorted(APPROVED_MEMBERS) if uid != OWNER_USER_ID)
+                edit_bot_message(chat_id, message_id, f"📝 *Remove Member*\n\n{members_str}\n\nReply dengan format:\n`/removemember <user_id>`")
+            return
+    
+    # --- DOWNLOAD CALLBACKS ---
     if len(parts) != 3 or parts[0] != "dl":
         answer_callback(callback_id)
         return

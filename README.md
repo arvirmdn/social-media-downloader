@@ -34,6 +34,48 @@ Backend FastAPI + yt-dlp untuk web downloader dan bot Telegram dengan **membersh
 
 ---
 
+## 📋 Daftar Command Bot
+
+### User Commands (Untuk Member)
+| Command | Fungsi |
+|---------|--------|
+| `/start` | Lihat greeting dan bantuan downloader |
+| `/help` | Lihat bantuan (sama seperti `/start`) |
+| Kirim link video | Downloader akan minta pilih kualitas |
+
+### Owner/Admin Commands (Khusus Pemilik Bot)
+| Command | Fungsi |
+|---------|--------|
+| `/menu` | Buka menu admin (lebih mudah) |
+| `/adminmenu` | Buka menu admin (alias `/menu`) |
+| `/addmember <user_id>` | Add user sebagai member |
+| `/removemember <user_id>` | Remove user dari member |
+| `/members` | Lihat daftar semua members |
+
+---
+
+## 🎯 Cara Pakai sebagai Owner
+
+### Cara 1: Pakai Menu (Recommended)
+```
+/menu
+```
+Bot akan show tombol:
+- 📋 Lihat Members
+- ➕ Add Member  
+- ➖ Remove Member
+
+Klik tombol untuk action apa yang mau dilakukan.
+
+### Cara 2: Direct Command
+```
+/addmember 987654321
+/removemember 987654321
+/members
+```
+
+---
+
 ## ✨ Fitur Bot Telegram
 
 ### User Features (Member Only)
@@ -49,9 +91,9 @@ Backend FastAPI + yt-dlp untuk web downloader dan bot Telegram dengan **membersh
 - Link Spotify otomatis dicari versi audionya di YouTube (judul diambil dari
   oEmbed Spotify), karena Spotify sendiri memproteksi audionya (DRM) dan tidak
   bisa diunduh langsung dari sana.
-- `/start` atau `/help` → pesan bantuan (member only).
 
 ### Admin Features (Owner Only)
+- `/menu` atau `/adminmenu` — buka menu admin dengan inline buttons
 - `/addmember <user_id>` — add user ke approved members list
 - `/removemember <user_id>` — remove user dari approved members
 - `/members` — lihat daftar semua approved members
@@ -83,9 +125,8 @@ Kalau orang yang belum di-add coba kirim link:
 
 ---
 
-## Cara Pakai sebagai Owner
+## Setup Webhook (Run Once Setelah Deploy)
 
-### Setup Webhook (Run Once Setelah Deploy)
 Setelah first deployment, buka di browser:
 ```
 https://my-app.up.railway.app/set-webhook
@@ -93,27 +134,19 @@ https://my-app.up.railway.app/set-webhook
 
 Kalau berhasil, return: `{"ok": true, "result": true}`
 
-### Lihat Member List
-```
-/members
-```
+---
 
-### Add Member
-```
-/addmember 987654321
-```
-(ganti dengan user_id target)
+## Cara Dapetin User ID Target (untuk /addmember)
 
-### Remove Member
-```
-/removemember 987654321
-```
+**Via Bot:**
+1. Add @userinfobot atau @getmyid_bot ke Telegram
+2. Forward pesan dari user target ke bot
+3. Bot bakal return user ID-nya
 
-### Test Sendiri
-1. Kirim `/start` sebagai member
-2. Kirim link (contoh: YouTube URL)
-3. Pilih kualitas
-4. Bot proses & kirim video
+**Via Group Chat:**
+1. Add target user ke group yang ada bot
+2. Kirim `/getid @username`
+3. Bot return user ID
 
 ---
 
@@ -137,6 +170,9 @@ Kalau berhasil, return: `{"ok": true, "result": true}`
 1. Pastikan user ID target bener (pakai @getmyid_bot)
 2. Kirim `/members` untuk verifikasi user ID-nya muncul
 3. Kalau nggak muncul, coba `/addmember` lagi
+
+### /menu hanya show untuk owner?
+Ya, itu benar. `/menu` hanya bisa diakses owner. User biasa hanya bisa pakai downloader features.
 
 ### Member list hilang saat restart
 1. Set `APPROVED_MEMBERS` env var dengan initial list (comma-separated)
@@ -163,8 +199,33 @@ Kalau berhasil, return: `{"ok": true, "result": true}`
 - [ ] Redeploy
 - [ ] Buka `/set-webhook` di browser
 - [ ] Test `/start` di bot
+- [ ] Test `/menu` untuk admin menu
+- [ ] Test `/addmember` untuk add member
 - [ ] Test download dengan link YouTube
-- [ ] Add member lain dengan `/addmember <id>`
+
+---
+
+## Testing Flow
+
+### 1. Test as Owner
+```
+/start       → Lihat greeting
+/menu        → Buka admin menu
+/members     → Lihat member list (hanya owner)
+/addmember <id> → Add member baru
+```
+
+### 2. Test as New Member (setelah di-add)
+```
+/start           → Bisa akses downloader
+Send YouTube URL → Bot minta pilih kualitas
+```
+
+### 3. Test as Non-Member
+```
+/start    → Bot kasih pesan "bukan member"
+Send link → Bot tolak dengan pesan error
+```
 
 ---
 
