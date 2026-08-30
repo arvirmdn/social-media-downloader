@@ -1,9 +1,13 @@
 from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, FileResponse
+from starlette.background import BackgroundTask
 from urllib.parse import quote
 import yt_dlp
 import os
+import glob
+import shutil
+import tempfile
 import requests
 
 app = FastAPI(title="Social Media Downloader API")
@@ -23,17 +27,6 @@ app.add_middleware(
 )
 
 ALLOWED_QUALITIES = [144, 240, 360, 480, 720, 1080, 1440, 2160]
-
-# Beberapa platform (terutama TikTok) memblokir request ke link CDN video-nya
-# kalau tidak ada header Referer yang cocok — makanya link mentahnya bisa 403
-# kalau dibuka langsung dari browser/Telegram tanpa lewat proxy kita sendiri.
-REFERER_MAP = {
-    "tiktok": "https://www.tiktok.com/",
-    "youtube": "https://www.youtube.com/",
-    "instagram": "https://www.instagram.com/",
-    "facebook": "https://www.facebook.com/",
-    "twitter": "https://twitter.com/",
-}
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -78,22 +71,25 @@ def sanitize_filename(name: str) -> str:
     return (cleaned or "video")[:60]
 
 
-def build_download_url(video_url: str, platform: str, title: str) -> str:
-    """Bungkus link CDN asli lewat /proxy server kita sendiri, supaya header
-    Referer yang benar selalu terpasang saat user benar-benar mengunduh."""
+def build_download_url(source_url: str, title: str, quality: int) -> str | None:
+    """Link ke endpoint /proxy kita sendiri — dia yang akan menyuruh yt-dlp
+    benar-benar mengunduh videonya (biar header/fingerprint per-platform pasti benar),
+    baru diteruskan ke user. Return None kalau PUBLIC_DOMAIN belum diset (nggak ada
+    cara aman untuk kasih link yang pasti jalan)."""
     if not PUBLIC_DOMAIN:
-        return video_url  # fallback: link mentah, mungkin 403 kalau platform-nya proteksi
+        return None
     filename = sanitize_filename(title) + ".mp4"
     return (
         f"https://{PUBLIC_DOMAIN}/proxy"
-        f"?url={quote(video_url, safe='')}"
-        f"&platform={quote(platform)}"
+        f"?source={quote(source_url, safe='')}"
+        f"&quality={quality}"
         f"&filename={quote(filename)}"
     )
 
 
 def fetch_video_info(url: str, quality: int = 720):
-    """Return (result_dict, error_message). Salah satu selalu None."""
+    """Ambil metadata + link video (cepat, tanpa benar-benar download filenya).
+    Return (result_dict, error_message). Salah satu selalu None."""
     if quality not in ALLOWED_QUALITIES:
         quality = min(ALLOWED_QUALITIES, key=lambda q: abs(q - quality))
 
@@ -116,8 +112,8 @@ def fetch_video_info(url: str, quality: int = 720):
     return {
         "status": "success",
         "title": title,
-        "video_url": video_url,  # link CDN asli — bisa 403 kalau dibuka langsung
-        "download_url": build_download_url(video_url, platform, title),  # link yang aman dipakai
+        "video_url": video_url,  # link CDN asli — beberapa platform (TikTok, dll) memblokir ini kalau dibuka langsung
+        "download_url": build_download_url(url, title, quality),  # link yang aman & pasti dicoba lewat yt-dlp
         "thumbnail": info.get("thumbnail", ""),
         "duration": info.get("duration", 0),
         "platform": platform,
@@ -155,8 +151,9 @@ def send_bot_download_result(chat_id, result: dict):
         f"🎬 *{result['title']}*\n"
         f"Platform: {result['platform'].upper()} • {result['quality']}p"
     )
+    download_link = result.get("download_url") or result["video_url"]
     keyboard = {
-        "inline_keyboard": [[{"text": "⬇️ Download Video", "url": result["download_url"]}]]
+        "inline_keyboard": [[{"text": "⬇️ Download Video", "url": download_link}]]
     }
     tg_api(chat_id, "sendMessage", {
         "text": caption,
@@ -171,7 +168,7 @@ def send_bot_download_result(chat_id, result: dict):
 async def root():
     return {
         "message": "yt-dlp API is running. Support TikTok, YouTube, Instagram, Facebook, Twitter, dan 1000+ platform lainnya.",
-        "endpoints": ["/download?url=...&quality=720", "/proxy?url=...&platform=...", "/health", "/telegram-webhook (POST)"],
+        "endpoints": ["/download?url=...&quality=720", "/proxy?source=...&quality=720", "/health", "/telegram-webhook (POST)"],
     }
 
 
@@ -201,32 +198,37 @@ async def download_video(
 
 @app.get("/proxy")
 async def proxy_download(
-    url: str = Query(..., description="Link CDN asli dari yt-dlp"),
-    platform: str = Query("", description="Nama platform, dipakai untuk pilih header Referer yang benar"),
+    source: str = Query(..., description="Link asli video (halaman TikTok/YouTube/dll), BUKAN link CDN"),
+    quality: int = Query(720),
     filename: str = Query("video.mp4"),
 ):
-    headers = {"User-Agent": USER_AGENT}
-    referer = REFERER_MAP.get(platform.lower())
-    if referer:
-        headers["Referer"] = referer
+    if quality not in ALLOWED_QUALITIES:
+        quality = min(ALLOWED_QUALITIES, key=lambda q: abs(q - quality))
+
+    tmp_dir = tempfile.mkdtemp(prefix="dl_")
+    ydl_opts = build_ydl_opts(quality)
+    ydl_opts["outtmpl"] = os.path.join(tmp_dir, "%(id)s.%(ext)s")
+    ydl_opts["noprogress"] = True
 
     try:
-        upstream = requests.get(url, headers=headers, stream=True, timeout=30)
-        upstream.raise_for_status()
-    except requests.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Sumber video menolak request (kemungkinan link sudah kedaluwarsa): {e}")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([source])
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Gagal mengambil video dari sumber: {e}")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=502, detail=f"Gagal mengunduh video: {e}")
 
-    def stream():
-        for chunk in upstream.iter_content(chunk_size=64 * 1024):
-            if chunk:
-                yield chunk
+    files = [f for f in glob.glob(os.path.join(tmp_dir, "*")) if os.path.isfile(f)]
+    if not files:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=502, detail="File hasil download tidak ditemukan di server.")
 
-    return StreamingResponse(
-        stream(),
-        media_type=upstream.headers.get("Content-Type", "video/mp4"),
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    filepath = files[0]
+
+    return FileResponse(
+        filepath,
+        media_type="video/mp4",
+        filename=filename,
+        background=BackgroundTask(lambda: shutil.rmtree(tmp_dir, ignore_errors=True)),
     )
 
 
