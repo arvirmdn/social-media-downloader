@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, HTTPException, Request
+from fastapi import FastAPI, Query, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from starlette.background import BackgroundTask
@@ -65,6 +65,38 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 URL_REGEX = re.compile(r"https?://\S+")
+
+# ---------- Rate limiting sederhana untuk endpoint publik (/download, /proxy) ----------
+# Endpoint ini bisa dipanggil siapa saja yang tahu URL-nya (bukan cuma dari web kita),
+# jadi dibatasi per-IP biar server nggak dibanjiri/di-abuse orang lain.
+RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "10"))  # per window
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+_rate_limit_hits: dict[str, list[float]] = {}
+
+
+def check_rate_limit(request: Request):
+    """Raise HTTPException 429 kalau IP ini sudah melebihi batas request dalam window waktu."""
+    client_ip = request.headers.get("x-forwarded-for", "")
+    client_ip = client_ip.split(",")[0].strip() if client_ip else (request.client.host if request.client else "unknown")
+
+    now = time.time()
+    hits = [t for t in _rate_limit_hits.get(client_ip, []) if now - t < RATE_LIMIT_WINDOW_SECONDS]
+
+    if len(hits) >= RATE_LIMIT_MAX_REQUESTS:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Terlalu banyak request. Maks {RATE_LIMIT_MAX_REQUESTS} request per {RATE_LIMIT_WINDOW_SECONDS} detik, coba lagi sebentar lagi.",
+        )
+
+    hits.append(now)
+    _rate_limit_hits[client_ip] = hits
+
+    # Bersih-bersih sesekali biar dict nggak membengkak terus (IP lain yang lama nganggur)
+    if len(_rate_limit_hits) > 500:
+        for ip in list(_rate_limit_hits.keys()):
+            _rate_limit_hits[ip] = [t for t in _rate_limit_hits[ip] if now - t < RATE_LIMIT_WINDOW_SECONDS]
+            if not _rate_limit_hits[ip]:
+                del _rate_limit_hits[ip]
 
 # Link yang lagi nunggu dipilih kualitasnya (in-memory — hilang kalau server
 # redeploy/restart pas user lagi mikir, tinggal kirim ulang linknya).
@@ -379,7 +411,8 @@ async def health():
 
 
 @app.get("/download")
-async def download_video(url: str = Query(...), quality: int = Query(720)):
+async def download_video(request: Request, url: str = Query(...), quality: int = Query(720)):
+    check_rate_limit(request)
     result, error = fetch_video_info(url, quality)
     if error:
         send_telegram_notification(f"❌ *Gagal Memproses Link!*\n• URL: {url}\n• Error: `{error}`")
@@ -394,7 +427,8 @@ async def download_video(url: str = Query(...), quality: int = Query(720)):
 
 
 @app.get("/proxy")
-async def proxy_download(source: str = Query(...), quality: int = Query(720), filename: str = Query("video.mp4")):
+async def proxy_download(request: Request, source: str = Query(...), quality: int = Query(720), filename: str = Query("video.mp4")):
+    check_rate_limit(request)
     try:
         filepath, tmp_dir = download_video_file(source, quality)
     except Exception as e:
@@ -749,16 +783,20 @@ def handle_callback_query(callback_query: dict):
 
 
 @app.post("/telegram-webhook")
-async def telegram_webhook(request: Request):
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     body = await request.json()
 
+    # Proses beneran (download video/audio pakai yt-dlp+ffmpeg) bisa makan waktu lama.
+    # Kalau dijalankan langsung di sini, webhook ini nge-block dan Telegram bisa anggap
+    # request "lambat merespons" lalu kirim ulang update-nya (download dobel). Makanya
+    # kita balas Telegram DULUAN ({"ok": true}), baru proses beratnya jalan di background.
     if "callback_query" in body:
-        handle_callback_query(body["callback_query"])
+        background_tasks.add_task(handle_callback_query, body["callback_query"])
         return {"ok": True}
 
     message = body.get("message") or body.get("channel_post")
     if message:
-        handle_incoming_message(message)
+        background_tasks.add_task(handle_incoming_message, message)
 
     return {"ok": True}
 
