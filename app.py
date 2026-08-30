@@ -20,10 +20,22 @@ app = FastAPI(title="Social Media Downloader API")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # notifikasi ke akun pribadimu (dari endpoint web)
 PUBLIC_DOMAIN = os.getenv("PUBLIC_DOMAIN") or os.getenv("RAILWAY_PUBLIC_DOMAIN") or ""
+OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "0"))  # user_id pemilik bot (set di Railway settings)
 
 TELEGRAM_MAX_UPLOAD_MB = 50  # batas resmi Telegram Bot API untuk upload langsung
 MAX_LINKS_PER_MESSAGE = 5    # batas link sekaligus dalam 1 pesan
 MAX_DURATION_MINUTES = int(os.getenv("MAX_DURATION_MINUTES", "15"))
+
+# Member list (in-memory, backup di env var APPROVED_MEMBERS)
+# Format di env var: "123456,789012,345678" (comma-separated user IDs)
+APPROVED_MEMBERS = set()
+if os.getenv("APPROVED_MEMBERS"):
+    try:
+        APPROVED_MEMBERS = set(int(uid.strip()) for uid in os.getenv("APPROVED_MEMBERS", "").split(",") if uid.strip())
+    except ValueError:
+        pass
+if OWNER_USER_ID > 0:
+    APPROVED_MEMBERS.add(OWNER_USER_ID)  # pemilik otomatis approved
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,6 +54,21 @@ URL_REGEX = re.compile(r"https?://\S+")
 # Link yang lagi nunggu dipilih kualitasnya (in-memory — hilang kalau server
 # redeploy/restart pas user lagi mikir, tinggal kirim ulang linknya).
 PENDING: dict[str, str] = {}
+
+
+def is_member(user_id: int) -> bool:
+    """Check apakah user sudah di-approve untuk akses downloader."""
+    return user_id in APPROVED_MEMBERS
+
+
+def add_member(user_id: int):
+    """Add user ke approved members list."""
+    APPROVED_MEMBERS.add(user_id)
+
+
+def remove_member(user_id: int):
+    """Remove user dari approved members list."""
+    APPROVED_MEMBERS.discard(user_id)
 
 
 # ---------- util ----------
@@ -504,20 +531,75 @@ def process_link(chat_id, url: str, quality: int = 720, audio_only: bool = False
 
 def handle_incoming_message(message: dict):
     chat_id = message["chat"]["id"]
+    user_id = message.get("from", {}).get("id")
     text = (message.get("text") or "").strip()
 
+    # --- ADMIN COMMANDS ---
+    if text.startswith("/addmember "):
+        if user_id != OWNER_USER_ID:
+            send_bot_message(chat_id, "❌ Hanya pemilik bot yang bisa pakai command ini.")
+            return
+        try:
+            target_uid = int(text.split()[1])
+            add_member(target_uid)
+            send_bot_message(chat_id, f"✅ User `{target_uid}` berhasil di-add sebagai member.")
+        except (IndexError, ValueError):
+            send_bot_message(chat_id, "Format: `/addmember <user_id>`")
+        return
+
+    if text.startswith("/removemember "):
+        if user_id != OWNER_USER_ID:
+            send_bot_message(chat_id, "❌ Hanya pemilik bot yang bisa pakai command ini.")
+            return
+        try:
+            target_uid = int(text.split()[1])
+            if target_uid == OWNER_USER_ID:
+                send_bot_message(chat_id, "❌ Nggak bisa remove pemilik bot dari member list.")
+                return
+            remove_member(target_uid)
+            send_bot_message(chat_id, f"✅ User `{target_uid}` berhasil di-remove dari member.")
+        except (IndexError, ValueError):
+            send_bot_message(chat_id, "Format: `/removemember <user_id>`")
+        return
+
+    if text == "/members":
+        if user_id != OWNER_USER_ID:
+            send_bot_message(chat_id, "❌ Hanya pemilik bot yang bisa lihat member list.")
+            return
+        if not APPROVED_MEMBERS:
+            send_bot_message(chat_id, "📋 Member list kosong.")
+            return
+        members_str = "\n".join(f"• `{uid}`" for uid in sorted(APPROVED_MEMBERS))
+        send_bot_message(chat_id, f"📋 *Member List ({len(APPROVED_MEMBERS)}):*\n{members_str}")
+        return
+
+    # --- USER COMMANDS ---
     if text in ("/start", "/help"):
+        if user_id and is_member(user_id):
+            send_bot_message(
+                chat_id,
+                "👋 *Halo tod ! Aku bot downloader arvirmdn.*\n\n"
+                "Kirim link dari:\n"
+                "🎵 TikTok  ▶️ YouTube  📸 Instagram  📘 Facebook  🐦 Twitter\n"
+                "🎧 Spotify _(otomatis dicari versi audionya di YouTube, karena Spotify tidak menyediakan unduhan langsung)_\n\n"
+                "*Cara pakai:*\n"
+                "• Kirim 1 link → aku tanya dulu mau kualitas / format apa\n"
+                f"• Kirim beberapa link sekaligus (maks {MAX_LINKS_PER_MESSAGE}) → langsung diproses semua di 720p\n\n"
+                f"⚠️ Video di atas {MAX_DURATION_MINUTES} menit atau {TELEGRAM_MAX_UPLOAD_MB}MB akan dikasih link download "
+                "(bukan dikirim langsung), karena itu batas dari Telegram sendiri."
+            )
+        else:
+            send_bot_message(
+                chat_id,
+                "❌ *lu bukan member tod*, member dulu sana ke admin gantenkk @asololeeeee"
+            )
+        return
+
+    # Check membership sebelum proses link
+    if not user_id or not is_member(user_id):
         send_bot_message(
             chat_id,
-            "👋 *Halo! Aku bot downloader.*\n\n"
-            "Kirim link dari:\n"
-            "🎵 TikTok  ▶️ YouTube  📸 Instagram  📘 Facebook  🐦 Twitter\n"
-            "🎧 Spotify _(otomatis dicari versi audionya di YouTube, karena Spotify tidak menyediakan unduhan langsung)_\n\n"
-            "*Cara pakai:*\n"
-            "• Kirim 1 link → aku tanya dulu mau kualitas / format apa\n"
-            f"• Kirim beberapa link sekaligus (maks {MAX_LINKS_PER_MESSAGE}) → langsung diproses semua di 720p\n\n"
-            f"⚠️ Video di atas {MAX_DURATION_MINUTES} menit atau {TELEGRAM_MAX_UPLOAD_MB}MB akan dikasih link download "
-            "(bukan dikirim langsung), karena itu batas dari Telegram sendiri."
+            "❌ *lu bukan member tod*, member dulu sana ke admin gantenkk @asololeeeee"
         )
         return
 
