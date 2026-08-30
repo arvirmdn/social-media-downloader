@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from urllib.parse import quote
 import yt_dlp
 import os
 import requests
@@ -11,6 +12,7 @@ app = FastAPI(title="Social Media Downloader API")
 # (Settings > Variables), JANGAN pernah ditulis langsung di kode ini.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # dipakai khusus notifikasi ke kamu sendiri
+PUBLIC_DOMAIN = os.getenv("PUBLIC_DOMAIN") or os.getenv("RAILWAY_PUBLIC_DOMAIN") or ""
 
 # WAJIB: tanpa ini, fetch() dari browser selalu diblok CORS
 app.add_middleware(
@@ -21,6 +23,22 @@ app.add_middleware(
 )
 
 ALLOWED_QUALITIES = [144, 240, 360, 480, 720, 1080, 1440, 2160]
+
+# Beberapa platform (terutama TikTok) memblokir request ke link CDN video-nya
+# kalau tidak ada header Referer yang cocok — makanya link mentahnya bisa 403
+# kalau dibuka langsung dari browser/Telegram tanpa lewat proxy kita sendiri.
+REFERER_MAP = {
+    "tiktok": "https://www.tiktok.com/",
+    "youtube": "https://www.youtube.com/",
+    "instagram": "https://www.instagram.com/",
+    "facebook": "https://www.facebook.com/",
+    "twitter": "https://twitter.com/",
+}
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 # ---------- yt-dlp helpers (dipakai bareng oleh endpoint web & bot Telegram) ----------
@@ -35,12 +53,7 @@ def build_ydl_opts(quality: int) -> dict:
         "extractor_args": {
             "youtube": {"player_client": ["android", "web"]},
         },
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            )
-        },
+        "http_headers": {"User-Agent": USER_AGENT},
     }
 
 
@@ -57,6 +70,26 @@ def extract_video_url(info: dict, quality: int) -> str | None:
         return None
     best = max(candidates, key=lambda f: f.get("height") or 0)
     return best.get("url")
+
+
+def sanitize_filename(name: str) -> str:
+    keep = "-_.() " + "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    cleaned = "".join(c for c in name if c in keep).strip()
+    return (cleaned or "video")[:60]
+
+
+def build_download_url(video_url: str, platform: str, title: str) -> str:
+    """Bungkus link CDN asli lewat /proxy server kita sendiri, supaya header
+    Referer yang benar selalu terpasang saat user benar-benar mengunduh."""
+    if not PUBLIC_DOMAIN:
+        return video_url  # fallback: link mentah, mungkin 403 kalau platform-nya proteksi
+    filename = sanitize_filename(title) + ".mp4"
+    return (
+        f"https://{PUBLIC_DOMAIN}/proxy"
+        f"?url={quote(video_url, safe='')}"
+        f"&platform={quote(platform)}"
+        f"&filename={quote(filename)}"
+    )
 
 
 def fetch_video_info(url: str, quality: int = 720):
@@ -77,13 +110,17 @@ def fetch_video_info(url: str, quality: int = 720):
     if not video_url:
         return None, "Tidak ada format video yang cocok ditemukan untuk kualitas ini."
 
+    title = info.get("title", "Video")
+    platform = info.get("extractor", "unknown")
+
     return {
         "status": "success",
-        "title": info.get("title", "Video"),
-        "video_url": video_url,
+        "title": title,
+        "video_url": video_url,  # link CDN asli — bisa 403 kalau dibuka langsung
+        "download_url": build_download_url(video_url, platform, title),  # link yang aman dipakai
         "thumbnail": info.get("thumbnail", ""),
         "duration": info.get("duration", 0),
-        "platform": info.get("extractor", "unknown"),
+        "platform": platform,
         "quality": quality,
     }, None
 
@@ -119,7 +156,7 @@ def send_bot_download_result(chat_id, result: dict):
         f"Platform: {result['platform'].upper()} • {result['quality']}p"
     )
     keyboard = {
-        "inline_keyboard": [[{"text": "⬇️ Download Video", "url": result["video_url"]}]]
+        "inline_keyboard": [[{"text": "⬇️ Download Video", "url": result["download_url"]}]]
     }
     tg_api(chat_id, "sendMessage", {
         "text": caption,
@@ -134,7 +171,7 @@ def send_bot_download_result(chat_id, result: dict):
 async def root():
     return {
         "message": "yt-dlp API is running. Support TikTok, YouTube, Instagram, Facebook, Twitter, dan 1000+ platform lainnya.",
-        "endpoints": ["/download?url=...&quality=720", "/health", "/telegram-webhook (POST)"],
+        "endpoints": ["/download?url=...&quality=720", "/proxy?url=...&platform=...", "/health", "/telegram-webhook (POST)"],
     }
 
 
@@ -160,6 +197,37 @@ async def download_video(
         f"• Platform: {result['platform'].upper()}\n• Kualitas: {quality}p\n• URL: {url}"
     )
     return result
+
+
+@app.get("/proxy")
+async def proxy_download(
+    url: str = Query(..., description="Link CDN asli dari yt-dlp"),
+    platform: str = Query("", description="Nama platform, dipakai untuk pilih header Referer yang benar"),
+    filename: str = Query("video.mp4"),
+):
+    headers = {"User-Agent": USER_AGENT}
+    referer = REFERER_MAP.get(platform.lower())
+    if referer:
+        headers["Referer"] = referer
+
+    try:
+        upstream = requests.get(url, headers=headers, stream=True, timeout=30)
+        upstream.raise_for_status()
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Sumber video menolak request (kemungkinan link sudah kedaluwarsa): {e}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Gagal mengambil video dari sumber: {e}")
+
+    def stream():
+        for chunk in upstream.iter_content(chunk_size=64 * 1024):
+            if chunk:
+                yield chunk
+
+    return StreamingResponse(
+        stream(),
+        media_type=upstream.headers.get("Content-Type", "video/mp4"),
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ---------- Bot Telegram: kirim link, dapat link download (mirror fitur web) ----------
@@ -202,15 +270,13 @@ async def set_webhook():
     """Panggil endpoint ini SEKALI lewat browser setelah deploy untuk mendaftarkan webhook ke Telegram."""
     if not TELEGRAM_BOT_TOKEN:
         raise HTTPException(status_code=400, detail="TELEGRAM_BOT_TOKEN belum diset.")
-
-    domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("PUBLIC_DOMAIN")
-    if not domain:
+    if not PUBLIC_DOMAIN:
         raise HTTPException(
             status_code=400,
             detail="Set env var PUBLIC_DOMAIN dulu (isi domain Railway kamu, tanpa https://), lalu redeploy."
         )
 
-    webhook_url = f"https://{domain}/telegram-webhook"
+    webhook_url = f"https://{PUBLIC_DOMAIN}/telegram-webhook"
     resp = requests.get(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
         params={"url": webhook_url},
