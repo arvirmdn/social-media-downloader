@@ -7,8 +7,8 @@ import requests
 
 app = FastAPI(title="Social Media Downloader API")
 
-# Konfigurasi Telegram Bot (Token bot dan Chat ID pribadi)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8752870096:AAFZdQYew6CtozJ6ClB-oiND1Thv6oFoaUM")
+# Konfigurasi Telegram Bot (Token bot baru dan Chat ID pribadi)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8752870096:AAHN817t1SULW-dA-YtrckDN1BjIWRT1Ymc")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8386378589")
 
 def send_telegram_notification(message: str):
