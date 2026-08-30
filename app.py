@@ -53,27 +53,40 @@ DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS members (user_id INTEGER PRIMARY KEY)"
+        "CREATE TABLE IF NOT EXISTS members (user_id INTEGER PRIMARY KEY, expires_at INTEGER)"
     )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS stats (key TEXT PRIMARY KEY, value INTEGER NOT NULL DEFAULT 0)"
     )
+    # Migrasi lembut untuk DB lama yang tabel members-nya belum punya kolom expires_at.
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(members)").fetchall()]
+        if "expires_at" not in cols:
+            conn.execute("ALTER TABLE members ADD COLUMN expires_at INTEGER")
+            conn.commit()
+    except Exception as e:
+        print(f"⚠️  Migrasi kolom expires_at gagal (boleh diabaikan kalau kolom sudah ada): {e}")
     return conn
 
 
-def load_members_from_db() -> set:
+def load_members_from_db() -> dict:
+    """Return dict {user_id: expires_at_unix_or_None}."""
     conn = get_db()
     try:
-        rows = conn.execute("SELECT user_id FROM members").fetchall()
-        return set(r[0] for r in rows)
+        rows = conn.execute("SELECT user_id, expires_at FROM members").fetchall()
+        return {r[0]: r[1] for r in rows}
     finally:
         conn.close()
 
 
-def db_add_member(user_id: int):
+def db_add_member(user_id: int, expires_at: int | None = None):
     conn = get_db()
     try:
-        conn.execute("INSERT OR IGNORE INTO members (user_id) VALUES (?)", (user_id,))
+        conn.execute(
+            "INSERT INTO members (user_id, expires_at) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET expires_at = excluded.expires_at",
+            (user_id, expires_at),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -110,35 +123,45 @@ def db_get_stat(key: str) -> int:
         conn.close()
 
 
-# Member list di-load dari DB saat startup, lalu dipegang di memory (set) biar
-# pengecekan is_member() tetap cepat — setiap perubahan (add/remove) langsung
-# ditulis ke DB juga lewat db_add_member()/db_remove_member().
-APPROVED_MEMBERS = load_members_from_db()
+# Member list di-load dari DB saat startup, lalu dipegang di memory sebagai
+# dict {user_id: expires_at_unix_or_None} biar pengecekan is_member() tetap
+# cepat — setiap perubahan (add/remove) langsung ditulis ke DB juga lewat
+# db_add_member()/db_remove_member().
+# expires_at None = member permanen (nggak pernah expired).
+APPROVED_MEMBERS: dict[int, int | None] = load_members_from_db()
+
+# Durasi paket membership yang bisa dipakai lewat /addmember <id> <paket>
+MEMBER_DURATIONS = {
+    "trial": 7 * 24 * 3600,       # 7 hari
+    "bulan": 30 * 24 * 3600,      # 1 bulan
+    "permanent": None,
+}
 
 # Migrasi dari env var APPROVED_MEMBERS lama (kalau masih dipakai) ke DB,
-# supaya member yang sebelumnya cuma "hidup" di env var ikut tersimpan permanen.
+# supaya member yang sebelumnya cuma "hidup" di env var ikut tersimpan permanen
+# (sebagai member permanen/expires_at=None).
 if os.getenv("APPROVED_MEMBERS"):
     try:
         legacy_ids = set(int(uid.strip()) for uid in os.getenv("APPROVED_MEMBERS", "").split(",") if uid.strip())
         for uid in legacy_ids:
             if uid not in APPROVED_MEMBERS:
                 db_add_member(uid)
-        APPROVED_MEMBERS |= legacy_ids
+                APPROVED_MEMBERS[uid] = None
     except ValueError:
         pass
 
-# Add owner ke approved members
+# Add owner ke approved members (selalu permanen)
 if OWNER_USER_ID > 0:
-    if OWNER_USER_ID not in APPROVED_MEMBERS:
-        db_add_member(OWNER_USER_ID)
-    APPROVED_MEMBERS.add(OWNER_USER_ID)  # pemilik otomatis approved
+    if OWNER_USER_ID not in APPROVED_MEMBERS or APPROVED_MEMBERS.get(OWNER_USER_ID) is not None:
+        db_add_member(OWNER_USER_ID, expires_at=None)
+    APPROVED_MEMBERS[OWNER_USER_ID] = None  # pemilik otomatis approved & permanen
     print(f"✅ Owner (ID: {OWNER_USER_ID}) added to approved members")
 else:
     print("⚠️  WARNING: OWNER_USER_ID tidak di-set! Set env var OWNER_USER_ID di Railway Settings > Variables")
     print("   Membership system DISABLED untuk sekarang (semua user bisa akses)")
 
 if APPROVED_MEMBERS:
-    print(f"✅ Approved members ({len(APPROVED_MEMBERS)}, dari DB: {DB_PATH}): {sorted(APPROVED_MEMBERS)}")
+    print(f"✅ Approved members ({len(APPROVED_MEMBERS)}, dari DB: {DB_PATH}): {sorted(APPROVED_MEMBERS.keys())}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -163,17 +186,27 @@ _rate_limit_hits: dict[str, list[float]] = {}
 
 
 def check_rate_limit(request: Request):
-    """Raise HTTPException 429 kalau IP ini sudah melebihi batas request dalam window waktu."""
+    """Raise HTTPException 429 kalau IP ini sudah melebihi batas request dalam window waktu.
+    Pesan error menyertakan sisa detik tunggu (retry_after) biar frontend bisa
+    tampilkan countdown yang jelas, bukan cuma teks generik."""
     client_ip = request.headers.get("x-forwarded-for", "")
     client_ip = client_ip.split(",")[0].strip() if client_ip else (request.client.host if request.client else "unknown")
+
+    record_traffic_event()
 
     now = time.time()
     hits = [t for t in _rate_limit_hits.get(client_ip, []) if now - t < RATE_LIMIT_WINDOW_SECONDS]
 
     if len(hits) >= RATE_LIMIT_MAX_REQUESTS:
+        oldest = min(hits)
+        retry_after = max(1, int(RATE_LIMIT_WINDOW_SECONDS - (now - oldest)))
         raise HTTPException(
             status_code=429,
-            detail=f"Terlalu banyak request. Maks {RATE_LIMIT_MAX_REQUESTS} request per {RATE_LIMIT_WINDOW_SECONDS} detik, coba lagi sebentar lagi.",
+            detail={
+                "message": f"Terlalu banyak request. Coba lagi dalam {retry_after} detik ya.",
+                "retry_after": retry_after,
+            },
+            headers={"Retry-After": str(retry_after)},
         )
 
     hits.append(now)
@@ -229,6 +262,68 @@ def check_web_origin(request: Request):
         detail="Akses ditolak: endpoint ini hanya bisa dipanggil dari web resminya.",
     )
 
+# ---------- Monitor lonjakan traffic & error rate (notifikasi ke owner) ----------
+# Sengaja sederhana (in-memory, per-instance) — cukup untuk kasih tahu owner kalau
+# ada sesuatu yang nggak wajar (traffic melonjak / error bertubi-tubi), tanpa perlu
+# infra monitoring terpisah. Ada cooldown biar owner nggak dispam notifikasi.
+TRAFFIC_WINDOW_SECONDS = int(os.getenv("TRAFFIC_WINDOW_SECONDS", "60"))
+TRAFFIC_SPIKE_THRESHOLD = int(os.getenv("TRAFFIC_SPIKE_THRESHOLD", "40"))   # request per window
+ERROR_SPIKE_THRESHOLD = int(os.getenv("ERROR_SPIKE_THRESHOLD", "8"))        # error per window
+ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "600"))    # 10 menit
+
+_traffic_hits: list[float] = []
+_error_hits: list[float] = []
+_last_alert_at: dict[str, float] = {"traffic": 0.0, "error": 0.0}
+
+
+def _prune(hits: list[float], now: float, window: float) -> list[float]:
+    return [t for t in hits if now - t < window]
+
+
+def _notify_owner(message: str):
+    """Kirim notifikasi khusus ke OWNER_USER_ID lewat bot (bukan TELEGRAM_CHAT_ID),
+    supaya owner-nya pasti kebagian meski TELEGRAM_CHAT_ID beda akun."""
+    if OWNER_USER_ID:
+        send_bot_message(OWNER_USER_ID, message)
+    else:
+        send_telegram_notification(message)
+
+
+def record_traffic_event():
+    """Panggil tiap ada request masuk ke endpoint publik. Kirim alert sekali
+    kalau jumlah request dalam window melebihi ambang batas."""
+    now = time.time()
+    global _traffic_hits
+    _traffic_hits.append(now)
+    _traffic_hits = _prune(_traffic_hits, now, TRAFFIC_WINDOW_SECONDS)
+
+    if len(_traffic_hits) >= TRAFFIC_SPIKE_THRESHOLD and now - _last_alert_at["traffic"] > ALERT_COOLDOWN_SECONDS:
+        _last_alert_at["traffic"] = now
+        _notify_owner(
+            f"🚨 *Lonjakan Traffic Terdeteksi!*\n"
+            f"`{len(_traffic_hits)}` request dalam {TRAFFIC_WINDOW_SECONDS} detik terakhir "
+            f"(ambang batas: {TRAFFIC_SPIKE_THRESHOLD})."
+        )
+
+
+def record_error_event(context: str = ""):
+    """Panggil tiap ada error di endpoint publik. Kirim alert sekali kalau
+    jumlah error dalam window melebihi ambang batas."""
+    now = time.time()
+    global _error_hits
+    _error_hits.append(now)
+    _error_hits = _prune(_error_hits, now, TRAFFIC_WINDOW_SECONDS)
+
+    if len(_error_hits) >= ERROR_SPIKE_THRESHOLD and now - _last_alert_at["error"] > ALERT_COOLDOWN_SECONDS:
+        _last_alert_at["error"] = now
+        extra = f"\nContoh terakhir: `{context}`" if context else ""
+        _notify_owner(
+            f"⚠️ *Error Rate Tinggi Terdeteksi!*\n"
+            f"`{len(_error_hits)}` error dalam {TRAFFIC_WINDOW_SECONDS} detik terakhir "
+            f"(ambang batas: {ERROR_SPIKE_THRESHOLD}).{extra}"
+        )
+
+
 # Link yang lagi nunggu dipilih kualitasnya. Disimpan sebagai (url, created_at)
 # supaya entry basi (user tidak pernah klik tombol kualitas) bisa dibersihkan —
 # tanpa ini dict-nya cuma membesar terus selama server hidup (memory leak kecil).
@@ -255,21 +350,43 @@ def pending_pop(req_id: str) -> str | None:
 
 def is_member(user_id: int) -> bool:
     """Check apakah user sudah di-approve untuk akses downloader.
-    Kalau OWNER_USER_ID = 0, membership system disabled (semua user bisa akses)."""
+    Kalau OWNER_USER_ID = 0, membership system disabled (semua user bisa akses).
+    Kalau membership user ini punya expires_at dan sudah lewat, dia otomatis
+    di-remove (lazy expiry — dicek tiap kali user interaksi, tanpa perlu cron)."""
     if OWNER_USER_ID == 0:  # membership system disabled
         return True
-    return user_id in APPROVED_MEMBERS
+    if user_id not in APPROVED_MEMBERS:
+        return False
+    expires_at = APPROVED_MEMBERS[user_id]
+    if expires_at is not None and time.time() > expires_at:
+        remove_member(user_id)  # sudah kedaluwarsa, bersihkan otomatis
+        return False
+    return True
 
 
-def add_member(user_id: int):
-    """Add user ke approved members list (memory + DB persisten)."""
-    APPROVED_MEMBERS.add(user_id)
-    db_add_member(user_id)
+def format_expiry(expires_at: int | None) -> str:
+    if expires_at is None:
+        return "permanen"
+    remaining = int(expires_at - time.time())
+    if remaining <= 0:
+        return "kedaluwarsa"
+    days, rem = divmod(remaining, 86400)
+    hours = rem // 3600
+    if days > 0:
+        return f"sisa {days} hari {hours} jam"
+    return f"sisa {hours} jam"
+
+
+def add_member(user_id: int, expires_at: int | None = None):
+    """Add user ke approved members list (memory + DB persisten).
+    expires_at: unix timestamp kapan membership habis, atau None untuk permanen."""
+    APPROVED_MEMBERS[user_id] = expires_at
+    db_add_member(user_id, expires_at)
 
 
 def remove_member(user_id: int):
     """Remove user dari approved members list (memory + DB persisten)."""
-    APPROVED_MEMBERS.discard(user_id)
+    APPROVED_MEMBERS.pop(user_id, None)
     db_remove_member(user_id)
 
 
@@ -319,6 +436,38 @@ def extract_video_url(info: dict, quality: int) -> str | None:
     return max(candidates, key=lambda f: f.get("height") or 0).get("url")
 
 
+def estimate_filesize_bytes(info: dict, quality: int | None = None) -> int | None:
+    """Cari estimasi ukuran file dari metadata yt-dlp. yt-dlp kadang punya
+    'filesize' (pasti) atau cuma 'filesize_approx' (perkiraan) tergantung platform.
+    Kalau ada beberapa format (belum dipilih quality-nya), ambil yang paling
+    cocok dengan quality yang diminta."""
+    direct = info.get("filesize") or info.get("filesize_approx")
+    if direct:
+        return int(direct)
+    formats = info.get("formats") or []
+    if not formats:
+        return None
+    candidates = [f for f in formats if f.get("filesize") or f.get("filesize_approx")]
+    if not candidates:
+        return None
+    if quality:
+        candidates = [f for f in candidates if (f.get("height") or 0) <= quality] or candidates
+        chosen = max(candidates, key=lambda f: f.get("height") or 0)
+    else:
+        chosen = max(candidates, key=lambda f: (f.get("filesize") or f.get("filesize_approx") or 0))
+    size = chosen.get("filesize") or chosen.get("filesize_approx")
+    return int(size) if size else None
+
+
+def format_filesize(num_bytes: int | None) -> str | None:
+    if not num_bytes:
+        return None
+    mb = num_bytes / (1024 * 1024)
+    if mb >= 1024:
+        return f"{mb / 1024:.2f} GB"
+    return f"{mb:.1f} MB"
+
+
 def sanitize_filename(name: str) -> str:
     keep = "-_.() " + "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     cleaned = "".join(c for c in name if c in keep).strip()
@@ -355,6 +504,71 @@ def resolve_spotify_title(spotify_url: str) -> str | None:
         return None
 
 
+MAX_PLAYLIST_ITEMS = int(os.getenv("MAX_PLAYLIST_ITEMS", "25"))
+
+
+def is_youtube_playlist(url: str) -> bool:
+    """Link YouTube dianggap playlist kalau ada parameter 'list=' dan BUKAN
+    cuma video biasa yang kebetulan dibuka dari dalam playlist (watch?v=...&list=...
+    tetap dianggap video tunggal, biar tidak mengejutkan user yang paste link video biasa)."""
+    lower = url.lower()
+    if "list=" not in lower:
+        return False
+    if "youtube.com/playlist" in lower:
+        return True
+    # watch?v=xxx&list=yyy -> masih video tunggal, bukan mode playlist
+    if "watch" in lower and "v=" in lower:
+        return False
+    return "youtube.com" in lower or "youtu.be" in lower
+
+
+def fetch_playlist_entries(url: str):
+    """Ambil daftar video dalam sebuah playlist YouTube (flat, tanpa resolve
+    format tiap video satu-satu biar cepat). Dibatasi MAX_PLAYLIST_ITEMS entri."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": "in_playlist",
+        "playlistend": MAX_PLAYLIST_ITEMS,
+        "socket_timeout": 20,
+        "http_headers": {"User-Agent": USER_AGENT},
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        return None, f"Gagal membaca playlist: {e}"
+    except Exception as e:
+        return None, f"Terjadi kesalahan server: {e}"
+
+    entries = info.get("entries") or []
+    if not entries:
+        return None, "Playlist ini kosong atau tidak bisa diakses (mungkin private)."
+
+    items = []
+    for e in entries[:MAX_PLAYLIST_ITEMS]:
+        if not e:
+            continue
+        video_id = e.get("id")
+        items.append({
+            "title": e.get("title") or "Video",
+            "url": e.get("url") or (f"https://www.youtube.com/watch?v={video_id}" if video_id else None),
+            "duration": e.get("duration") or 0,
+            "thumbnail": (e.get("thumbnails") or [{}])[-1].get("url") if e.get("thumbnails") else None,
+        })
+    items = [it for it in items if it["url"]]
+    if not items:
+        return None, "Tidak ada video valid yang bisa dibaca dari playlist ini."
+
+    return {
+        "status": "success",
+        "playlist_title": info.get("title") or "Playlist",
+        "total_found": len(items),
+        "truncated": len(entries) > MAX_PLAYLIST_ITEMS,
+        "items": items,
+    }, None
+
+
 def fetch_video_info(url: str, quality: int = 720):
     if quality not in ALLOWED_QUALITIES:
         quality = min(ALLOWED_QUALITIES, key=lambda q: abs(q - quality))
@@ -379,6 +593,7 @@ def fetch_video_info(url: str, quality: int = 720):
 
     title = info.get("title", "Video")
     platform = info.get("extractor", "unknown")
+    filesize_bytes = estimate_filesize_bytes(info, quality)
     return {
         "status": "success",
         "title": title,
@@ -388,6 +603,8 @@ def fetch_video_info(url: str, quality: int = 720):
         "duration": duration,
         "platform": platform,
         "quality": quality,
+        "filesize_bytes": filesize_bytes,
+        "filesize_label": format_filesize(filesize_bytes),
     }, None
 
 
@@ -441,6 +658,7 @@ def fetch_audio_info(url: str):
     if not audio_url:
         return None, "Tidak ada format audio yang cocok ditemukan."
 
+    filesize_bytes = estimate_filesize_bytes(info)
     return {
         "status": "success",
         "title": title,
@@ -449,6 +667,8 @@ def fetch_audio_info(url: str):
         "thumbnail": info.get("thumbnail", ""),
         "duration": duration,
         "platform": platform if not is_spotify(url) else platform,
+        "filesize_bytes": filesize_bytes,
+        "filesize_label": format_filesize(filesize_bytes),
     }, None
 
 
@@ -647,6 +867,7 @@ async def root():
             "/proxy?source=...&quality=720",
             "/download-audio?url=...",
             "/proxy-audio?source=...",
+            "/playlist-info?url=... (YouTube playlist)",
             "/download-zip (POST, body: [{url, quality}])",
             "/health",
             "/telegram-webhook (POST)",
@@ -665,6 +886,7 @@ async def download_video(request: Request, url: str = Query(...), quality: int =
     check_rate_limit(request)
     result, error = fetch_video_info(url, quality)
     if error:
+        record_error_event(error)
         send_telegram_notification(f"❌ *Gagal Memproses Link!*\n• URL: {url}\n• Error: `{error}`")
         status_code = 404 if "Tidak ada format" in error else 422
         raise HTTPException(status_code=status_code, detail=error)
@@ -676,6 +898,20 @@ async def download_video(request: Request, url: str = Query(...), quality: int =
     return result
 
 
+@app.get("/playlist-info")
+async def playlist_info(request: Request, url: str = Query(...)):
+    """Dipakai frontend ketika mendeteksi link playlist YouTube: mengembalikan
+    daftar video di dalamnya (maks MAX_PLAYLIST_ITEMS) supaya user bisa pilih
+    beberapa video sekaligus, alih-alih cuma bisa 1 link penuh manual."""
+    check_web_origin(request)
+    check_rate_limit(request)
+    result, error = fetch_playlist_entries(url)
+    if error:
+        record_error_event(error)
+        raise HTTPException(status_code=422, detail=error)
+    return result
+
+
 @app.get("/proxy")
 async def proxy_download(request: Request, source: str = Query(...), quality: int = Query(720), filename: str = Query("video.mp4")):
     check_web_origin(request)
@@ -683,6 +919,7 @@ async def proxy_download(request: Request, source: str = Query(...), quality: in
     try:
         filepath, tmp_dir = download_video_file(source, quality)
     except Exception as e:
+        record_error_event(str(e))
         raise HTTPException(status_code=502, detail=f"Gagal mengunduh video: {e}")
     return FileResponse(
         filepath, media_type="video/mp4", filename=filename,
@@ -698,6 +935,7 @@ async def download_audio(request: Request, url: str = Query(...)):
     check_rate_limit(request)
     result, error = fetch_audio_info(url)
     if error:
+        record_error_event(error)
         send_telegram_notification(f"❌ *Gagal Memproses Link Audio!*\n• URL: {url}\n• Error: `{error}`")
         status_code = 404 if "Tidak ada format" in error else 422
         raise HTTPException(status_code=status_code, detail=error)
@@ -716,6 +954,7 @@ async def proxy_download_audio(request: Request, source: str = Query(...), filen
     try:
         filepath, tmp_dir = download_audio_file(source)
     except Exception as e:
+        record_error_event(str(e))
         raise HTTPException(status_code=502, detail=f"Gagal mengunduh audio: {e}")
     return FileResponse(
         filepath, media_type="audio/mpeg", filename=filename,
@@ -821,7 +1060,7 @@ def is_spotify(url: str) -> bool:
     return "spotify.com" in url.lower()
 
 
-def process_spotify(chat_id, spotify_url: str, status_message_id: int | None):
+def process_spotify(chat_id, spotify_url: str, status_message_id: int | None) -> bool:
     if status_message_id:
         edit_bot_message(chat_id, status_message_id, "🎧 Spotify terdeteksi — mencari versi audionya di YouTube...")
     else:
@@ -839,7 +1078,7 @@ def process_spotify(chat_id, spotify_url: str, status_message_id: int | None):
             edit_bot_message(chat_id, status_message_id, text)
         else:
             send_bot_message(chat_id, text)
-        return
+        return False
 
     esc_title = md_escape(track_title)
     base_text = f"📥 Mengunduh audio\n*{esc_title}*\n_dicari otomatis di YouTube_"
@@ -859,21 +1098,23 @@ def process_spotify(chat_id, spotify_url: str, status_message_id: int | None):
                 f"(maks {TELEGRAM_MAX_UPLOAD_MB}MB). Spotify sendiri tidak menyediakan link download, jadi coba cari "
                 "manual versi lebih pendek di YouTube ya."
             )
-            return
+            return False
 
         edit_bot_message(chat_id, status_message_id, f"📤 Mengirim *{esc_title}*...")
         ok = send_bot_audio_file(chat_id, filepath, track_title, "Spotify (dicari via YouTube)")
         delete_bot_message(chat_id, status_message_id)
         if not ok:
             send_bot_message(chat_id, f"⚠️ Gagal mengirim audio untuk *{esc_title}*, coba lagi beberapa saat lagi.")
+        return ok
     except Exception as e:
         edit_bot_message(chat_id, status_message_id, f"❌ Gagal mengunduh audio untuk *{esc_title}*:\n{e}")
+        return False
     finally:
         if tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def process_and_deliver(chat_id, url: str, quality: int, audio_only: bool, status_message_id: int | None = None):
+def process_and_deliver(chat_id, url: str, quality: int, audio_only: bool, status_message_id: int | None = None) -> bool:
     if status_message_id:
         edit_bot_message(chat_id, status_message_id, "🔎 Mengambil info video...")
     else:
@@ -886,7 +1127,7 @@ def process_and_deliver(chat_id, url: str, quality: int, audio_only: bool, statu
             edit_bot_message(chat_id, status_message_id, text)
         else:
             send_bot_message(chat_id, text)
-        return
+        return False
 
     duration = result.get("duration") or 0
     if duration and duration > MAX_DURATION_MINUTES * 60:
@@ -899,7 +1140,7 @@ def process_and_deliver(chat_id, url: str, quality: int, audio_only: bool, statu
             edit_bot_message(chat_id, status_message_id, text)
         else:
             send_bot_message(chat_id, text)
-        return
+        return False
 
     esc_title = md_escape(result["title"])
     label = "🎵 Audio MP3" if audio_only else f"🎬 Video {quality}p"
@@ -925,7 +1166,7 @@ def process_and_deliver(chat_id, url: str, quality: int, audio_only: bool, statu
                 f"(maks {TELEGRAM_MAX_UPLOAD_MB}MB dari Telegram). Ini link download-nya:"
             )
             send_bot_download_link(chat_id, result["title"], result["platform"], quality, result["download_url"], result["video_url"])
-            return
+            return True
 
         edit_bot_message(chat_id, status_message_id, f"📤 Mengirim *{esc_title}*...")
 
@@ -939,21 +1180,23 @@ def process_and_deliver(chat_id, url: str, quality: int, audio_only: bool, statu
         if not ok:
             send_bot_message(chat_id, f"⚠️ Gagal kirim *{esc_title}* langsung, ini link download-nya sebagai gantinya:")
             send_bot_download_link(chat_id, result["title"], result["platform"], quality, result["download_url"], result["video_url"])
+        return True
     except Exception as e:
         edit_bot_message(chat_id, status_message_id, f"❌ Gagal mengunduh *{esc_title}*:\n{e}")
+        return False
     finally:
         if tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def process_link(chat_id, url: str, quality: int = 720, audio_only: bool = False, status_message_id: int | None = None):
+def process_link(chat_id, url: str, quality: int = 720, audio_only: bool = False, status_message_id: int | None = None) -> bool:
     # Dihitung untuk /stats. Ini menghitung "link yang diproses" (bukan jaminan
     # berhasil terkirim), tapi cukup untuk gambaran kasar seberapa aktif bot dipakai.
     db_increment_stat("bot_links_processed")
     if is_spotify(url):
-        process_spotify(chat_id, url, status_message_id)
+        return process_spotify(chat_id, url, status_message_id)
     else:
-        process_and_deliver(chat_id, url, quality, audio_only, status_message_id)
+        return process_and_deliver(chat_id, url, quality, audio_only, status_message_id)
 
 
 def handle_incoming_message(message: dict):
@@ -987,12 +1230,29 @@ def handle_incoming_message(message: dict):
         if user_id != OWNER_USER_ID:
             send_bot_message(chat_id, "❌ Hanya pemilik bot yang bisa pakai command ini.")
             return
+        parts_cmd = text.split()
         try:
-            target_uid = int(text.split()[1])
-            add_member(target_uid)
-            send_bot_message(chat_id, f"✅ User `{target_uid}` berhasil di-add sebagai member.")
+            target_uid = int(parts_cmd[1])
         except (IndexError, ValueError):
-            send_bot_message(chat_id, "Format: `/addmember <user_id>`")
+            send_bot_message(
+                chat_id,
+                "Format: `/addmember <user_id> [paket]`\n\n"
+                "Paket (opsional):\n"
+                "• `trial` — 7 hari\n"
+                "• `bulan` — 1 bulan\n"
+                "• tanpa paket = permanen\n\n"
+                "Contoh: `/addmember 123456789 trial`"
+            )
+            return
+        paket = parts_cmd[2].lower() if len(parts_cmd) > 2 else "permanent"
+        if paket not in MEMBER_DURATIONS:
+            send_bot_message(chat_id, "❌ Paket tidak dikenali. Pakai `trial`, `bulan`, atau kosongkan untuk permanen.")
+            return
+        duration = MEMBER_DURATIONS[paket]
+        expires_at = int(time.time() + duration) if duration else None
+        add_member(target_uid, expires_at)
+        label = format_expiry(expires_at)
+        send_bot_message(chat_id, f"✅ User `{target_uid}` berhasil di-add sebagai member ({label}).")
         return
 
     if text.startswith("/removemember "):
@@ -1023,7 +1283,9 @@ def handle_incoming_message(message: dict):
         if not APPROVED_MEMBERS:
             send_bot_message(chat_id, "📋 Member list kosong.")
             return
-        members_str = "\n".join(f"• `{uid}`" for uid in sorted(APPROVED_MEMBERS))
+        members_str = "\n".join(
+            f"• `{uid}` — {format_expiry(APPROVED_MEMBERS[uid])}" for uid in sorted(APPROVED_MEMBERS)
+        )
         send_bot_message(chat_id, f"📋 *Member List ({len(APPROVED_MEMBERS)}):*\n{members_str}")
         return
 
@@ -1139,9 +1401,30 @@ def handle_incoming_message(message: dict):
         return
 
     urls = urls[:MAX_LINKS_PER_MESSAGE]
-    send_bot_message(chat_id, f"📋 Terdeteksi {len(urls)} link, aku proses semua satu-satu ya (video di 720p)...")
-    for u in urls:
-        process_link(chat_id, u, quality=720, audio_only=False)
+    total = len(urls)
+    summary_msg_id = send_bot_message(
+        chat_id, f"📋 Terdeteksi {total} link, aku proses satu-satu ya (video di 720p)...\n\n⏳ Progres: 0/{total}"
+    )
+    success_count = 0
+    for idx, u in enumerate(urls, start=1):
+        ok = process_link(chat_id, u, quality=720, audio_only=False)
+        if ok:
+            success_count += 1
+        if summary_msg_id:
+            edit_bot_message(
+                chat_id, summary_msg_id,
+                f"📋 Memproses {total} link (video di 720p)...\n\n"
+                f"⏳ Progres: {idx}/{total} link diproses • ✅ {success_count} berhasil"
+            )
+
+    if summary_msg_id:
+        failed_count = total - success_count
+        result_line = f"✅ Selesai: {success_count}/{total} link berhasil diproses"
+        if failed_count:
+            result_line += f", ❌ {failed_count} gagal (lihat pesan error di atas)."
+        else:
+            result_line += "."
+        edit_bot_message(chat_id, summary_msg_id, result_line)
 
 
 def handle_callback_query(callback_query: dict):
@@ -1167,12 +1450,19 @@ def handle_callback_query(callback_query: dict):
             if not APPROVED_MEMBERS:
                 edit_bot_message(chat_id, message_id, "📋 Member list kosong.")
             else:
-                members_str = "\n".join(f"• `{uid}`" for uid in sorted(APPROVED_MEMBERS))
+                members_str = "\n".join(
+                    f"• `{uid}` — {format_expiry(APPROVED_MEMBERS[uid])}" for uid in sorted(APPROVED_MEMBERS)
+                )
                 edit_bot_message(chat_id, message_id, f"📋 *Member List ({len(APPROVED_MEMBERS)}):*\n{members_str}")
             return
         
         elif action == "addmember":
-            edit_bot_message(chat_id, message_id, "📝 *Tambah Member*\n\nReply dengan format:\n`/addmember <user_id>`\n\nContoh: `/addmember 123456789`")
+            edit_bot_message(
+                chat_id, message_id,
+                "📝 *Tambah Member*\n\nReply dengan format:\n`/addmember <user_id> [paket]`\n\n"
+                "Paket (opsional): `trial` (7 hari), `bulan` (1 bulan), atau kosongkan untuk permanen.\n\n"
+                "Contoh:\n`/addmember 123456789 trial`\n`/addmember 123456789`"
+            )
             return
         
         elif action == "removemember":
@@ -1240,4 +1530,8 @@ async def set_webhook():
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc: HTTPException):
-    return JSONResponse(status_code=exc.status_code, content={"status": "error", "message": exc.detail})
+    if isinstance(exc.detail, dict):
+        content = {"status": "error", **exc.detail}
+    else:
+        content = {"status": "error", "message": exc.detail}
+    return JSONResponse(status_code=exc.status_code, content=content, headers=getattr(exc, "headers", None) or {})

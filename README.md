@@ -53,7 +53,7 @@ Backend FastAPI + yt-dlp untuk web downloader dan bot Telegram dengan **membersh
 |---------|--------|
 | `/menu` | Buka menu admin (lebih mudah) |
 | `/adminmenu` | Buka menu admin (alias `/menu`) |
-| `/addmember <user_id>` | Add user sebagai member |
+| `/addmember <user_id> [paket]` | Add user sebagai member. Paket: `trial` (7 hari), `bulan` (1 bulan), atau kosongkan untuk permanen |
 | `/removemember <user_id>` | Remove user dari member |
 | `/members` | Lihat daftar semua members |
 | `/stats` | Lihat statistik bot (jumlah member, link diproses) |
@@ -87,7 +87,9 @@ Klik tombol untuk action apa yang mau dilakukan.
 
 ### User Features (Member Only)
 - Kirim 1 link → tombol pilihan kualitas 360p/720p/1080p atau audio MP3.
-- Kirim beberapa link sekaligus (maks 5) → diproses otomatis di 720p.
+- Kirim beberapa link sekaligus (maks 5) → diproses otomatis di 720p, dengan
+  **pesan progres batch** yang terus di-update ("Progres: 2/5 • ✅ 2 berhasil")
+  sampai semua link selesai, plus ringkasan akhir.
 - Video/audio dikirim LANGSUNG ke chat kalau ≤ 50MB (batas Telegram Bot API),
   otomatis fallback ke link download kalau lebih besar.
 - Pesan status ("Mengambil info...", "Mengunduh...") jadi satu pesan yang terus
@@ -99,17 +101,64 @@ Klik tombol untuk action apa yang mau dilakukan.
   oEmbed Spotify), karena Spotify sendiri memproteksi audionya (DRM) dan tidak
   bisa diunduh langsung dari sana.
 
+### Membership dengan Masa Berlaku (Trial / Bulanan / Permanen)
+- `/addmember <user_id> trial` — kasih akses 7 hari, otomatis expired setelahnya.
+- `/addmember <user_id> bulan` — kasih akses 1 bulan, otomatis expired setelahnya.
+- `/addmember <user_id>` (tanpa paket) — member permanen seperti sebelumnya.
+- Expiry dicek otomatis ("lazy check") tiap kali user itu interaksi dengan bot —
+  begitu masa aktifnya habis, dia otomatis kehilangan akses tanpa perlu cron job.
+- `/members` sekarang menampilkan sisa waktu tiap member (`sisa 5 hari 3 jam`,
+  `permanen`, dll).
+
 ### Admin Features (Owner Only)
 - `/menu` atau `/adminmenu` — buka menu admin dengan inline buttons
-- `/addmember <user_id>` — add user ke approved members list
+- `/addmember <user_id> [paket]` — add user ke approved members list
 - `/removemember <user_id>` — remove user dari approved members
-- `/members` — lihat daftar semua approved members
+- `/members` — lihat daftar semua approved members beserta sisa masa aktifnya
+
+### Monitor Lonjakan Traffic & Error (Notifikasi ke Owner)
+- Kalau jumlah request ke endpoint publik (`/download`, `/proxy`, dll) melonjak
+  melebihi ambang batas dalam waktu singkat, OWNER_USER_ID otomatis dapat pesan
+  peringatan lewat bot.
+- Kalau jumlah error dari endpoint tersebut melonjak (banyak link gagal diproses
+  beruntun), owner juga dapat notifikasi terpisah.
+- Ada cooldown 10 menit antar notifikasi jenis yang sama, biar owner nggak
+  kebanjiran pesan kalau kondisinya berlangsung lama.
+- Diatur lewat env var (semua opsional): `TRAFFIC_WINDOW_SECONDS` (default 60),
+  `TRAFFIC_SPIKE_THRESHOLD` (default 40 request/window), `ERROR_SPIKE_THRESHOLD`
+  (default 8 error/window), `ALERT_COOLDOWN_SECONDS` (default 600).
 
 ### Non-Member Response
 Kalau orang yang belum di-add coba kirim link:
 ```
 ❌ lu bukan member tod, member dulu sana ke admin gantenkk @asololeeeee
 ```
+
+---
+
+## 🌐 Fitur Web (Frontend)
+
+- **Preview sebelum download** — setelah link diproses, tampil kartu pratinjau
+  (thumbnail, judul, durasi, perkiraan ukuran file) dulu, baru user menekan
+  tombol Download untuk benar-benar mengunduh.
+- **Progress bar unduhan real** — saat menekan Download, progress bar terisi
+  sesuai persentase byte yang sudah terunduh (kalau server sumbernya mendukung),
+  fallback ke mode indeterminate + buka tab baru kalau progress real tidak bisa
+  dibaca (mis. dibatasi CORS oleh CDN pihak ketiga).
+- **Estimasi ukuran file** — ditampilkan di kartu preview & di tombol Download,
+  diambil dari metadata `filesize`/`filesize_approx` yt-dlp (endpoint
+  `/download` & `/download-audio` sekarang menyertakan `filesize_bytes` dan
+  `filesize_label`).
+- **Playlist YouTube** — kalau user tempel link playlist YouTube (mengandung
+  `list=`), web akan menampilkan checklist video di dalamnya (maks 25,
+  lewat endpoint baru `/playlist-info`) supaya user bisa pilih beberapa video
+  sekaligus (maks 5 sesuai batas biasa) alih-alih harus salin link satu-satu.
+- **Rate-limit yang lebih ramah** — kalau kena batas request, web menampilkan
+  banner dengan hitung mundur detik sampai boleh coba lagi, bukan cuma pesan
+  error generik.
+- **Badge "Baru!"** di tombol platform — gampang dipindah ke platform lain
+  dengan menambahkan atribut `data-badge="new"` + elemen
+  `<span class="platform-new-badge">Baru!</span>` di `index.html`.
 
 ---
 
