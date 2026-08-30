@@ -438,30 +438,13 @@ def extract_video_url(info: dict, quality: int) -> str | None:
 
 def is_tiktok_photo_url(url: str) -> bool:
     """Post foto/slide (carousel) TikTok pakai path /photo/<id> di URL-nya,
-    beda dari /video/<id> untuk video biasa — dipakai buat deteksi dini
-    sebelum extract_video_url() (yang memang tidak akan pernah nemu format
-    video di post foto, karena post foto beneran tidak punya stream video)."""
+    beda dari /video/<id> untuk video biasa. Ini cuma dipakai sebagai deteksi
+    CEPAT lewat pola URL (buat skip langsung ke alur foto tanpa nyoba yt-dlp
+    dulu) — bukan satu-satunya jalan deteksi, karena link pendek TikTok
+    (vt.tiktok.com/xxx) tidak akan cocok pola ini sebelum di-resolve. Lihat
+    fetch_video_info() untuk fallback kedua yang menangkap kasus link pendek."""
     lower = url.lower()
     return "tiktok.com" in lower and "/photo/" in lower
-
-
-def extract_tiktok_photos(info: dict) -> list[str]:
-    """Ambil daftar URL foto dari post TikTok mode foto/slide. yt-dlp versi
-    baru expose ini lewat key 'images' langsung di info dict; versi lebih
-    lama cuma taruh tiap foto sebagai 'format' tersendiri (vcodec='none',
-    ext gambar) di dalam 'formats', jadi kita fallback ke situ juga."""
-    photos: list[str] = []
-    for img in info.get("images") or []:
-        u = img.get("url") if isinstance(img, dict) else img
-        if u:
-            photos.append(u)
-    if photos:
-        return photos
-    image_exts = {"jpg", "jpeg", "png", "webp"}
-    for f in info.get("formats", []) or []:
-        if f.get("vcodec") == "none" and f.get("ext") in image_exts and f.get("url"):
-            photos.append(f["url"])
-    return photos
 
 
 def estimate_filesize_bytes(info: dict, quality: int | None = None) -> int | None:
@@ -600,10 +583,26 @@ def fetch_playlist_entries(url: str):
 def fetch_video_info(url: str, quality: int = 720):
     if quality not in ALLOWED_QUALITIES:
         quality = min(ALLOWED_QUALITIES, key=lambda q: abs(q - quality))
+
+    # Deteksi cepat lewat pola URL (skip yt-dlp sama sekali kalau sudah jelas
+    # post foto/slide, biar tidak buang waktu nyoba yt-dlp yang pasti gagal).
+    if is_tiktok_photo_url(url):
+        return fetch_tiktok_photo_info(url)
+
     try:
         with yt_dlp.YoutubeDL(build_ydl_opts(quality)) as ydl:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as e:
+        # yt-dlp TIDAK PUNYA extractor untuk pola URL /photo/ TikTok sama
+        # sekali (selalu "Unsupported URL", bukan soal pilihan format) —
+        # jadi kalau link pendek (vt.tiktok.com/xxx) ternyata resolve ke post
+        # foto, baru ketahuan di sini (bukan dari pola URL di atas, karena
+        # link pendek belum kelihatan /photo/-nya). Coba sebagai foto sebelum
+        # nyerah total.
+        if "tiktok.com" in url.lower() and "Unsupported URL" in str(e):
+            photo_result, photo_error = fetch_tiktok_photo_info(url)
+            if photo_result:
+                return photo_result, None
         return None, f"Gagal memproses link: {e}"
     except Exception as e:
         return None, f"Terjadi kesalahan server: {e}"
@@ -624,6 +623,7 @@ def fetch_video_info(url: str, quality: int = 720):
     filesize_bytes = estimate_filesize_bytes(info, quality)
     return {
         "status": "success",
+        "type": "video",
         "title": title,
         "video_url": video_url,
         "download_url": build_download_url(url, title, quality),
@@ -637,37 +637,31 @@ def fetch_video_info(url: str, quality: int = 720):
 
 
 def fetch_tiktok_photo_info(url: str):
-    """Versi khusus post TikTok mode foto/slide (carousel) — dipisah dari
-    fetch_video_info() karena post foto tidak punya stream video sama
-    sekali, jadi build_ydl_opts (yang mensyaratkan format video) tidak
-    relevan di sini."""
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 20,
-        "http_headers": {"User-Agent": USER_AGENT},
-    }
+    """Khusus post TikTok mode foto/slide (carousel). PAKAI TikWM, BUKAN
+    yt-dlp — sudah dikonfirmasi lewat riset (termasuk laporan bug yt-dlp
+    sendiri) bahwa yt-dlp belum punya extractor untuk pola URL /photo/ TikTok
+    sama sekali, jadi selalu gagal dengan 'Unsupported URL' apapun opsinya.
+    TikWM sudah lama mendukung mode foto/slide ini (field 'images' di
+    response-nya), termasuk resolve link pendek (vt.tiktok.com) sendiri."""
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except yt_dlp.utils.DownloadError as e:
-        return None, f"Gagal memproses link: {e}"
+        resp = requests.get(
+            "https://www.tikwm.com/api/",
+            params={"url": url},
+            headers={"User-Agent": USER_AGENT},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
     except Exception as e:
-        return None, f"Terjadi kesalahan server: {e}"
+        return None, f"Gagal memproses link: {e}"
 
-    photos = extract_tiktok_photos(info)
+    data = payload.get("data") or {}
+    photos = data.get("images") or []
     if not photos:
-        return None, "Tidak ada foto yang ditemukan pada postingan TikTok ini."
+        return None, "Tidak ada foto yang ditemukan pada postingan TikTok ini (atau link ini bukan post foto/slide)."
 
-    audio_url = None
-    audio_candidates = [
-        f for f in (info.get("formats") or [])
-        if f.get("url") and f.get("acodec") != "none" and f.get("vcodec") == "none"
-    ]
-    if audio_candidates:
-        audio_url = max(audio_candidates, key=lambda f: f.get("abr") or 0).get("url")
-
-    title = info.get("title") or info.get("description") or "TikTok Photo"
+    title = data.get("title") or "TikTok Photo"
+    audio_url = data.get("music") or None
     return {
         "status": "success",
         "type": "photo",
@@ -1209,6 +1203,12 @@ async def download_zip(request: Request, items: list[ZipItem] = Body(...)):
                         if error:
                             manifest_lines.append(f"[GAGAL] {url} — {error}")
                             continue
+                        if info.get("type") == "photo":
+                            manifest_lines.append(
+                                f"[GAGAL] {url} — Link ini post foto/slide TikTok, belum didukung di ZIP batch video. "
+                                "Pakai tombol Download khusus foto TikTok di halaman utama."
+                            )
+                            continue
                         filepath, tmp_dir = download_video_file(url, q)
 
                     cleanup_dirs.append(tmp_dir)
@@ -1319,6 +1319,13 @@ def process_and_deliver(chat_id, url: str, quality: int, audio_only: bool, statu
             send_bot_message(chat_id, text)
         return False
 
+    if result.get("type") == "photo":
+        # Ternyata link pendek TikTok ini resolve ke post foto/slide (baru
+        # ketahuan di sini, bukan dari pola URL, karena link pendek belum
+        # kelihatan /photo/-nya sebelum di-resolve) — alihkan ke pengiriman
+        # album foto, pakai hasil yang sudah didapat (tidak perlu fetch ulang).
+        return process_tiktok_photo(chat_id, url, status_message_id, result=result)
+
     duration = result.get("duration") or 0
     if duration and duration > MAX_DURATION_MINUTES * 60:
         text = (
@@ -1379,20 +1386,23 @@ def process_and_deliver(chat_id, url: str, quality: int, audio_only: bool, statu
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def process_tiktok_photo(chat_id, url: str, status_message_id: int | None = None) -> bool:
-    if status_message_id:
-        edit_bot_message(chat_id, status_message_id, "🖼️ Mengambil foto-foto TikTok...")
-    else:
-        status_message_id = send_bot_message(chat_id, "🖼️ Mengambil foto-foto TikTok...")
-
-    result, error = fetch_tiktok_photo_info(url)
-    if error:
-        text = f"❌ Gagal memproses link:\n{error}"
+def process_tiktok_photo(chat_id, url: str, status_message_id: int | None = None, result: dict | None = None) -> bool:
+    if result is None:
         if status_message_id:
-            edit_bot_message(chat_id, status_message_id, text)
+            edit_bot_message(chat_id, status_message_id, "🖼️ Mengambil foto-foto TikTok...")
         else:
-            send_bot_message(chat_id, text)
-        return False
+            status_message_id = send_bot_message(chat_id, "🖼️ Mengambil foto-foto TikTok...")
+
+        result, error = fetch_tiktok_photo_info(url)
+        if error:
+            text = f"❌ Gagal memproses link:\n{error}"
+            if status_message_id:
+                edit_bot_message(chat_id, status_message_id, text)
+            else:
+                send_bot_message(chat_id, text)
+            return False
+    elif not status_message_id:
+        status_message_id = send_bot_message(chat_id, "🖼️ Menyiapkan foto-foto TikTok...")
 
     esc_title = md_escape(result["title"])
     photos = result["photos"]
