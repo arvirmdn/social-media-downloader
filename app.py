@@ -7,14 +7,12 @@ import requests
 
 app = FastAPI(title="Social Media Downloader API")
 
-# Konfigurasi Telegram Bot (Token bot dan Chat ID pribadi)
+# Konfigurasi Telegram Bot (Token bot dan Chat ID pribadi)[cite: 7]
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8752870096:AAFZdQYew6CtozJ6ClB-oiND1Thv6oFoaUM")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8386378589")
 
 def send_telegram_notification(message: str):
-    """Fungsi pembantu untuk mengirim pesan ke Telegram Bot"""
-    if not TELEGRAM_BOT_TOKEN or "MASUKKAN" in TELEGRAM_BOT_TOKEN:
-        return
+    """Fungsi pembantu untuk mengirim pesan ke Telegram Bot"""[cite: 7]
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -22,11 +20,12 @@ def send_telegram_notification(message: str):
         "parse_mode": "Markdown"
     }
     try:
-        requests.post(url, json=payload, timeout=5)
+        response = requests.post(url, json=payload, timeout=5)
+        print("Telegram Response:", response.text)
     except Exception as e:
         print(f"Gagal mengirim notifikasi Telegram: {e}")
 
-# WAJIB: tanpa ini, fetch() dari browser selalu diblok CORS
+# WAJIB: tanpa ini, fetch() dari browser selalu diblok CORS[cite: 7]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -114,7 +113,7 @@ async def download_video(
     title = info.get("title", "Video")
     platform = info.get("extractor", "unknown")
 
-    # Kirim notifikasi sukses ke Telegram
+    # Kirim notifikasi sukses ke Telegram[cite: 7]
     send_telegram_notification(f"📥 *Unduhan Berhasil!*\n• Judul: {title}\n• Platform: {platform.upper()}\n• Kualitas: {quality}p\n• URL: {url}")
 
     return {
