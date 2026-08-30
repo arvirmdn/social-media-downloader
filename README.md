@@ -1,65 +1,47 @@
-# Social Media Downloader API
+# Social Media Downloader API + Telegram Bot
 
-Backend sederhana berbasis FastAPI + yt-dlp untuk mengambil link video langsung
-(TikTok, YouTube, Instagram, Facebook, Twitter, dan platform lain yang didukung yt-dlp).
+Backend FastAPI + yt-dlp untuk mengambil link video langsung (TikTok, YouTube,
+Instagram, Facebook, Twitter, dll), dipakai oleh web downloader DAN bot Telegram.
 
 ## Endpoint
 
 - `GET /` — info instance
 - `GET /health` — cek instance hidup
-- `GET /download?url=<link>&quality=<144|240|360|480|720|1080|1440|2160>` — ambil link video langsung
+- `GET /download?url=<link>&quality=<144|240|360|480|720|1080|1440|2160>` — dipakai frontend web
+- `POST /telegram-webhook` — dipanggil Telegram tiap ada pesan masuk ke bot
+- `GET /set-webhook` — dipanggil SEKALI lewat browser setelah deploy untuk mendaftarkan webhook
 
-Contoh respons sukses:
-```json
-{
-  "status": "success",
-  "title": "Judul video",
-  "video_url": "https://...",
-  "thumbnail": "https://...",
-  "duration": 30,
-  "platform": "tiktok",
-  "quality": 720
-}
-```
+## Environment Variables (Railway > Settings > Variables)
 
-Contoh respons gagal:
-```json
-{ "status": "error", "message": "Gagal memproses link: ..." }
-```
+- `TELEGRAM_BOT_TOKEN` — token bot dari @BotFather (WAJIB untuk fitur bot & notifikasi)
+- `TELEGRAM_CHAT_ID` — chat id pribadimu (dipakai khusus notifikasi sukses/gagal dari web,
+  BUKAN dipakai bot untuk membalas user lain)
+- `PUBLIC_DOMAIN` — domain publik Railway kamu TANPA `https://`, misal
+  `web-production-0c5698.up.railway.app` (dipakai `/set-webhook` untuk tahu URL webhook-nya sendiri)
 
-## Notifikasi Telegram (opsional)
+## Cara mengaktifkan fitur bot Telegram
 
-API ini bisa mengirim notifikasi ke Telegram setiap ada percobaan download
-(sukses/gagal). Supaya aktif, set dua Environment Variables di Railway
-(Settings > Variables) — **jangan pernah ditulis langsung di `app.py`**:
+1. Set ketiga env var di atas di Railway, redeploy.
+2. Buka `https://<domain-kamu>/set-webhook` sekali lewat browser — kalau responsnya
+   `{"ok": true, "result": true, ...}` berarti webhook berhasil terpasang.
+3. Buka bot kamu di Telegram, kirim link TikTok/YouTube/dll — bot akan balas dengan
+   tombol "⬇️ Download Video".
+4. Ketik `/start` di bot untuk lihat pesan bantuan.
 
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
-
-Kalau salah satu tidak diset, notifikasi otomatis dilewati (tidak dianggap error).
-
-⚠️ **Keamanan**: kalau token bot pernah ke-commit langsung di kode (bukan lewat
-env var) dan repo-nya publik, anggap token itu bocor — generate ulang lewat
-@BotFather di Telegram (`/revoke` atau `/token`) sesegera mungkin.
+Catatan: bot membalas dengan **link download langsung** (bukan mengirim file video),
+supaya tidak kena batas ukuran file dari Telegram Bot API dan tidak membebani bandwidth
+server kamu.
 
 ## Deploy
 
 Bisa dideploy ke Railway, Render, atau Koyeb — semuanya mendeteksi `requirements.txt`
-dan `Procfile` secara otomatis. Tidak butuh database atau storage.
+dan `Procfile` secara otomatis.
 
-**Wajib**: setelah deploy, generate/catat domain publiknya, lalu isi domain itu
-di `YTDLP_API_URL` pada `script.js` frontend.
-
-## Catatan
+## Catatan lain
 
 - `yt-dlp` sengaja tidak dikunci ke versi tertentu di `requirements.txt`, supaya
-  setiap kali di-build ulang, pip mengambil versi terbaru — ini penting karena
-  yt-dlp perlu update rutin mengikuti perubahan di TikTok/YouTube/dll. Kalau
-  situs berubah dan API mulai gagal total, coba redeploy dulu (biar dapat
-  yt-dlp versi terbaru) sebelum curiga ada bug di kode ini.
-- YouTube kadang menampilkan error "Sign in to confirm you're not a bot" —
-  ini pembatasan dari YouTube, bukan bug di API ini. Kode sudah mencoba
-  workaround (`player_client: android`) yang membantu di sebagian kasus,
-  tapi tidak 100% terjamin.
-- Instagram: video publik biasanya bisa, tapi story/reel privat butuh login
-  dan tidak didukung di sini.
+  setiap kali di-build ulang, pip mengambil versi terbaru.
+- YouTube kadang menampilkan error "Sign in to confirm you're not a bot" — pembatasan
+  dari YouTube, bukan bug di API ini.
+- TikTok kadang gagal diproses kalau IP server (Railway/cloud) diblokir TikTok —
+  bukan bug di kode, ini pembatasan dari sisi TikTok terhadap IP datacenter.
