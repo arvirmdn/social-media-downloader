@@ -7,12 +7,10 @@ import requests
 
 app = FastAPI(title="Social Media Downloader API")
 
-# Konfigurasi Telegram Bot (Ambil dari Environment Variable Railway atau isi langsung)
-TELEGRAM_BOT_TOKEN = os.getenv("AAFzDqYEw6CtozJ6ClB-oiNDlTHv6oFoaUM", "AAFzDqYEw6CtozJ6ClB-oiNDlTHv6oFoaUM")
-TELEGRAM_CHAT_ID = os.getenv("8752870096", "8752870096")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "AAFZdQYew6CtozJ6ClB-oiND1Thv6oFoaUM")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8752870096")
 
 def send_telegram_notification(message: str):
-    """Fungsi pembantu untuk mengirim pesan ke Telegram Bot"""
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "MASUKKAN_BOT_TOKEN_ANDA":
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -26,7 +24,6 @@ def send_telegram_notification(message: str):
     except Exception as e:
         print(f"Gagal mengirim notifikasi Telegram: {e}")
 
-# WAJIB: tanpa ini, fetch() dari browser selalu diblok CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,7 +32,6 @@ app.add_middleware(
 )
 
 ALLOWED_QUALITIES = [144, 240, 360, 480, 720, 1080, 1440, 2160]
-
 
 def build_ydl_opts(quality: int) -> dict:
     return {
@@ -55,7 +51,6 @@ def build_ydl_opts(quality: int) -> dict:
         },
     }
 
-
 def extract_video_url(info: dict, quality: int) -> str | None:
     video_url = info.get("url")
     if video_url:
@@ -70,7 +65,6 @@ def extract_video_url(info: dict, quality: int) -> str | None:
     best = max(candidates, key=lambda f: f.get("height") or 0)
     return best.get("url")
 
-
 @app.get("/")
 async def root():
     return {
@@ -78,11 +72,9 @@ async def root():
         "endpoints": ["/download?url=...&quality=720", "/health"],
     }
 
-
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
 
 @app.get("/download")
 async def download_video(
@@ -103,7 +95,7 @@ async def download_video(
         raise HTTPException(status_code=422, detail=f"Gagal memproses link: {error_msg}")
     except Exception as e:
         error_msg = str(e)
-        send_telegram_notification(f"⚠️ *Kesalahan Server (Internal Error)*\n• URL: {url}\n• Error: `{error_msg}`")
+        send_telegram_notification(f"⚠️ *Kesalahan Server*\n• URL: {url}\n• Error: `{error_msg}`")
         raise HTTPException(status_code=500, detail=f"Terjadi kesalahan server: {error_msg}")
 
     video_url = extract_video_url(info, quality)
@@ -114,7 +106,6 @@ async def download_video(
     title = info.get("title", "Video")
     platform = info.get("extractor", "unknown")
 
-    # Kirim notifikasi sukses ke Telegram
     send_telegram_notification(f"📥 *Unduhan Berhasil!*\n• Judul: {title}\n• Platform: {platform.upper()}\n• Kualitas: {quality}p\n• URL: {url}")
 
     return {
@@ -126,7 +117,6 @@ async def download_video(
         "platform": platform,
         "quality": quality,
     }
-
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc: HTTPException):
