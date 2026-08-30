@@ -18,6 +18,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # dipakai khusus notifikasi ke kamu sendiri
 PUBLIC_DOMAIN = os.getenv("PUBLIC_DOMAIN") or os.getenv("RAILWAY_PUBLIC_DOMAIN") or ""
 
+# Batas resmi Telegram Bot API untuk upload file langsung lewat bot
+TELEGRAM_MAX_UPLOAD_MB = 50
+
 # WAJIB: tanpa ini, fetch() dari browser selalu diblok CORS
 app.add_middleware(
     CORSMiddleware,
@@ -72,10 +75,8 @@ def sanitize_filename(name: str) -> str:
 
 
 def build_download_url(source_url: str, title: str, quality: int) -> str | None:
-    """Link ke endpoint /proxy kita sendiri — dia yang akan menyuruh yt-dlp
-    benar-benar mengunduh videonya (biar header/fingerprint per-platform pasti benar),
-    baru diteruskan ke user. Return None kalau PUBLIC_DOMAIN belum diset (nggak ada
-    cara aman untuk kasih link yang pasti jalan)."""
+    """Link ke endpoint /proxy kita sendiri (yt-dlp yang benar-benar download,
+    baru diteruskan ke user). Return None kalau PUBLIC_DOMAIN belum diset."""
     if not PUBLIC_DOMAIN:
         return None
     filename = sanitize_filename(title) + ".mp4"
@@ -112,13 +113,39 @@ def fetch_video_info(url: str, quality: int = 720):
     return {
         "status": "success",
         "title": title,
-        "video_url": video_url,  # link CDN asli — beberapa platform (TikTok, dll) memblokir ini kalau dibuka langsung
-        "download_url": build_download_url(url, title, quality),  # link yang aman & pasti dicoba lewat yt-dlp
+        "video_url": video_url,
+        "download_url": build_download_url(url, title, quality),
         "thumbnail": info.get("thumbnail", ""),
         "duration": info.get("duration", 0),
         "platform": platform,
         "quality": quality,
     }, None
+
+
+def download_video_file(source_url: str, quality: int) -> str:
+    """Benar-benar mengunduh video ke folder sementara, return path filenya.
+    Pemanggil WAJIB hapus tmp_dir (parent folder file ini) setelah selesai pakai."""
+    if quality not in ALLOWED_QUALITIES:
+        quality = min(ALLOWED_QUALITIES, key=lambda q: abs(q - quality))
+
+    tmp_dir = tempfile.mkdtemp(prefix="dl_")
+    ydl_opts = build_ydl_opts(quality)
+    ydl_opts["outtmpl"] = os.path.join(tmp_dir, "%(id)s.%(ext)s")
+    ydl_opts["noprogress"] = True
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([source_url])
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+    files = [f for f in glob.glob(os.path.join(tmp_dir, "*")) if os.path.isfile(f)]
+    if not files:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise RuntimeError("File hasil download tidak ditemukan di server.")
+
+    return files[0], tmp_dir
 
 
 # ---------- Telegram helpers ----------
@@ -146,7 +173,7 @@ def send_bot_message(chat_id, text: str):
     tg_api(chat_id, "sendMessage", {"text": text})
 
 
-def send_bot_download_result(chat_id, result: dict):
+def send_bot_download_link(chat_id, result: dict):
     caption = (
         f"🎬 *{result['title']}*\n"
         f"Platform: {result['platform'].upper()} • {result['quality']}p"
@@ -160,6 +187,26 @@ def send_bot_download_result(chat_id, result: dict):
         "parse_mode": "Markdown",
         "reply_markup": keyboard,
     })
+
+
+def send_bot_video_file(chat_id, filepath: str, title: str, platform: str, quality: int) -> bool:
+    """Upload file video langsung ke chat. Return True kalau berhasil."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    caption = f"🎬 {title}\nPlatform: {platform.upper()} • {quality}p"[:1024]
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
+    try:
+        with open(filepath, "rb") as f:
+            files = {"video": f}
+            data = {"chat_id": chat_id, "caption": caption, "supports_streaming": True}
+            resp = requests.post(url, data=data, files=files, timeout=180)
+        ok = resp.json().get("ok", False)
+        if not ok:
+            print("sendVideo gagal:", resp.text)
+        return ok
+    except Exception as e:
+        print(f"Gagal upload video ke Telegram: {e}")
+        return False
 
 
 # ---------- Endpoint web (dipakai frontend Blogspot/Vercel) ----------
@@ -202,27 +249,10 @@ async def proxy_download(
     quality: int = Query(720),
     filename: str = Query("video.mp4"),
 ):
-    if quality not in ALLOWED_QUALITIES:
-        quality = min(ALLOWED_QUALITIES, key=lambda q: abs(q - quality))
-
-    tmp_dir = tempfile.mkdtemp(prefix="dl_")
-    ydl_opts = build_ydl_opts(quality)
-    ydl_opts["outtmpl"] = os.path.join(tmp_dir, "%(id)s.%(ext)s")
-    ydl_opts["noprogress"] = True
-
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([source])
+        filepath, tmp_dir = download_video_file(source, quality)
     except Exception as e:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
         raise HTTPException(status_code=502, detail=f"Gagal mengunduh video: {e}")
-
-    files = [f for f in glob.glob(os.path.join(tmp_dir, "*")) if os.path.isfile(f)]
-    if not files:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(status_code=502, detail="File hasil download tidak ditemukan di server.")
-
-    filepath = files[0]
 
     return FileResponse(
         filepath,
@@ -232,7 +262,7 @@ async def proxy_download(
     )
 
 
-# ---------- Bot Telegram: kirim link, dapat link download (mirror fitur web) ----------
+# ---------- Bot Telegram: kirim link, dapat VIDEO-nya langsung di chat ----------
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
@@ -248,7 +278,9 @@ async def telegram_webhook(request: Request):
         send_bot_message(
             chat_id,
             "Halo! Kirim link TikTok/YouTube/Instagram/Facebook/Twitter ke sini, "
-            "nanti aku balikin link download-nya. Contoh: https://vt.tiktok.com/xxxxx/"
+            "nanti aku kirim videonya langsung ke chat ini. Contoh: https://vt.tiktok.com/xxxxx/\n\n"
+            f"(Kalau videonya lebih dari {TELEGRAM_MAX_UPLOAD_MB}MB, aku kasih link download sebagai gantinya, "
+            "karena itu batas dari Telegram sendiri, bukan dariku.)"
         )
         return {"ok": True}
 
@@ -256,14 +288,36 @@ async def telegram_webhook(request: Request):
         send_bot_message(chat_id, "Kirim link video yang valid ya (harus diawali http/https).")
         return {"ok": True}
 
-    send_bot_message(chat_id, "⏳ Memproses linknya, tunggu sebentar...")
+    send_bot_message(chat_id, "⏳ Memproses & mengunduh videonya, tunggu sebentar...")
 
     result, error = fetch_video_info(text, quality=720)
     if error:
         send_bot_message(chat_id, f"❌ Gagal memproses: {error}")
         return {"ok": True}
 
-    send_bot_download_result(chat_id, result)
+    tmp_dir = None
+    try:
+        filepath, tmp_dir = download_video_file(text, result["quality"])
+        size_mb = os.path.getsize(filepath) / (1024 * 1024)
+
+        if size_mb > TELEGRAM_MAX_UPLOAD_MB:
+            send_bot_message(
+                chat_id,
+                f"⚠️ Video ini {size_mb:.1f}MB, kelewat besar buat dikirim langsung lewat bot "
+                f"(maks {TELEGRAM_MAX_UPLOAD_MB}MB dari Telegram). Ini link download-nya:"
+            )
+            send_bot_download_link(chat_id, result)
+        else:
+            ok = send_bot_video_file(chat_id, filepath, result["title"], result["platform"], result["quality"])
+            if not ok:
+                send_bot_message(chat_id, "⚠️ Gagal kirim video langsung, ini link download-nya sebagai gantinya:")
+                send_bot_download_link(chat_id, result)
+    except Exception as e:
+        send_bot_message(chat_id, f"❌ Gagal mengunduh video: {e}")
+    finally:
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     return {"ok": True}
 
 
