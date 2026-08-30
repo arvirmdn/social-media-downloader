@@ -261,6 +261,7 @@ def fetch_audio_info(url: str):
         "format": "bestaudio/best",
         "noplaylist": True,
         "socket_timeout": 20,
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
         "http_headers": {"User-Agent": USER_AGENT},
     }
     try:
@@ -332,6 +333,7 @@ def download_audio_file(source_url: str, progress_hook=None):
         "noplaylist": True,
         "socket_timeout": 20,
         "outtmpl": os.path.join(tmp_dir, "%(id)s.%(ext)s"),
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
         "http_headers": {"User-Agent": USER_AGENT},
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
