@@ -7,11 +7,13 @@ import requests
 
 app = FastAPI(title="Social Media Downloader API")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "AAFZdQYew6CtozJ6ClB-oiND1Thv6oFoaUM")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8752870096")
+# Konfigurasi Telegram Bot (Token bot dan Chat ID pribadi)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8752870096:AAFZdQYew6CtozJ6ClB-oiND1Thv6oFoaUM")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8386378589")
 
 def send_telegram_notification(message: str):
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "MASUKKAN_BOT_TOKEN_ANDA":
+    """Fungsi pembantu untuk mengirim pesan ke Telegram Bot"""
+    if not TELEGRAM_BOT_TOKEN or "MASUKKAN" in TELEGRAM_BOT_TOKEN:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -24,6 +26,7 @@ def send_telegram_notification(message: str):
     except Exception as e:
         print(f"Gagal mengirim notifikasi Telegram: {e}")
 
+# WAJIB: tanpa ini, fetch() dari browser selalu diblok CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,6 +35,7 @@ app.add_middleware(
 )
 
 ALLOWED_QUALITIES = [144, 240, 360, 480, 720, 1080, 1440, 2160]
+
 
 def build_ydl_opts(quality: int) -> dict:
     return {
@@ -51,6 +55,7 @@ def build_ydl_opts(quality: int) -> dict:
         },
     }
 
+
 def extract_video_url(info: dict, quality: int) -> str | None:
     video_url = info.get("url")
     if video_url:
@@ -65,6 +70,7 @@ def extract_video_url(info: dict, quality: int) -> str | None:
     best = max(candidates, key=lambda f: f.get("height") or 0)
     return best.get("url")
 
+
 @app.get("/")
 async def root():
     return {
@@ -72,9 +78,11 @@ async def root():
         "endpoints": ["/download?url=...&quality=720", "/health"],
     }
 
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
 
 @app.get("/download")
 async def download_video(
@@ -106,6 +114,7 @@ async def download_video(
     title = info.get("title", "Video")
     platform = info.get("extractor", "unknown")
 
+    # Kirim notifikasi sukses ke Telegram
     send_telegram_notification(f"📥 *Unduhan Berhasil!*\n• Judul: {title}\n• Platform: {platform.upper()}\n• Kualitas: {quality}p\n• URL: {url}")
 
     return {
@@ -117,6 +126,7 @@ async def download_video(
         "platform": platform,
         "quality": quality,
     }
+
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc: HTTPException):
