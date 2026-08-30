@@ -20,7 +20,13 @@ app = FastAPI(title="Social Media Downloader API")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # notifikasi ke akun pribadimu (dari endpoint web)
 PUBLIC_DOMAIN = os.getenv("PUBLIC_DOMAIN") or os.getenv("RAILWAY_PUBLIC_DOMAIN") or ""
-OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "0"))  # user_id pemilik bot (set di Railway settings)
+
+# OWNER_USER_ID — WAJIB diset di Railway Settings > Variables
+# Bisa dapat dari @getmyid_bot atau @userinfobot
+try:
+    OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "0"))
+except ValueError:
+    OWNER_USER_ID = 0
 
 TELEGRAM_MAX_UPLOAD_MB = 50  # batas resmi Telegram Bot API untuk upload langsung
 MAX_LINKS_PER_MESSAGE = 5    # batas link sekaligus dalam 1 pesan
@@ -34,8 +40,17 @@ if os.getenv("APPROVED_MEMBERS"):
         APPROVED_MEMBERS = set(int(uid.strip()) for uid in os.getenv("APPROVED_MEMBERS", "").split(",") if uid.strip())
     except ValueError:
         pass
+
+# Add owner ke approved members
 if OWNER_USER_ID > 0:
     APPROVED_MEMBERS.add(OWNER_USER_ID)  # pemilik otomatis approved
+    print(f"✅ Owner (ID: {OWNER_USER_ID}) added to approved members")
+else:
+    print("⚠️  WARNING: OWNER_USER_ID tidak di-set! Set env var OWNER_USER_ID di Railway Settings > Variables")
+    print("   Membership system DISABLED untuk sekarang (semua user bisa akses)")
+
+if APPROVED_MEMBERS:
+    print(f"✅ Approved members: {sorted(APPROVED_MEMBERS)}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -57,7 +72,10 @@ PENDING: dict[str, str] = {}
 
 
 def is_member(user_id: int) -> bool:
-    """Check apakah user sudah di-approve untuk akses downloader."""
+    """Check apakah user sudah di-approve untuk akses downloader.
+    Kalau OWNER_USER_ID = 0, membership system disabled (semua user bisa akses)."""
+    if OWNER_USER_ID == 0:  # membership system disabled
+        return True
     return user_id in APPROVED_MEMBERS
 
 
@@ -536,6 +554,9 @@ def handle_incoming_message(message: dict):
 
     # --- ADMIN COMMANDS ---
     if text.startswith("/addmember "):
+        if OWNER_USER_ID == 0:
+            send_bot_message(chat_id, "❌ Membership system belum aktif. Set `OWNER_USER_ID` di Railway Settings dulu.")
+            return
         if user_id != OWNER_USER_ID:
             send_bot_message(chat_id, "❌ Hanya pemilik bot yang bisa pakai command ini.")
             return
@@ -548,6 +569,9 @@ def handle_incoming_message(message: dict):
         return
 
     if text.startswith("/removemember "):
+        if OWNER_USER_ID == 0:
+            send_bot_message(chat_id, "❌ Membership system belum aktif. Set `OWNER_USER_ID` di Railway Settings dulu.")
+            return
         if user_id != OWNER_USER_ID:
             send_bot_message(chat_id, "❌ Hanya pemilik bot yang bisa pakai command ini.")
             return
@@ -563,6 +587,9 @@ def handle_incoming_message(message: dict):
         return
 
     if text == "/members":
+        if OWNER_USER_ID == 0:
+            send_bot_message(chat_id, "❌ Membership system belum aktif. Set `OWNER_USER_ID` di Railway Settings dulu.")
+            return
         if user_id != OWNER_USER_ID:
             send_bot_message(chat_id, "❌ Hanya pemilik bot yang bisa lihat member list.")
             return
@@ -575,7 +602,19 @@ def handle_incoming_message(message: dict):
 
     # --- USER COMMANDS ---
     if text in ("/start", "/help"):
-        if user_id and is_member(user_id):
+        # Kalau OWNER_USER_ID belum di-set, tampilkan warning ke owner
+        if OWNER_USER_ID == 0 and user_id:
+            send_bot_message(
+                chat_id,
+                "👋 *Halo tod ! Aku bot downloader arvirmdn.*\n\n"
+                "⚠️ *SETUP REQUIRED:*\n"
+                f"Your Telegram ID: `{user_id}`\n\n"
+                "Set env var di Railway:\n"
+                f"`OWNER_USER_ID={user_id}`\n\n"
+                "Setelah itu redeploy, baru membership system aktif. "
+                "Untuk sekarang, semua orang bisa akses downloader."
+            )
+        elif user_id and is_member(user_id):
             send_bot_message(
                 chat_id,
                 "👋 *Halo tod ! Aku bot downloader arvirmdn.*\n\n"

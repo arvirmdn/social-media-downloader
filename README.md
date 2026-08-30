@@ -2,6 +2,38 @@
 
 Backend FastAPI + yt-dlp untuk web downloader dan bot Telegram dengan **membership-only access**.
 
+## ⚙️ SETUP YANG PENTING
+
+### Step 0: Dapatkan User ID Telegram Kamu
+1. Buka @getmyid_bot atau @userinfobot di Telegram
+2. Kirim `/start`
+3. Bot akan kasih: `Your user ID is: 123456789`
+4. **Copy angka itu** — ini `OWNER_USER_ID` kamu
+
+### Step 1: Set Environment Variable di Railway
+1. Go to **Railway Console > Project > Settings > Variables**
+2. Tambahkan (minimal):
+   ```
+   TELEGRAM_BOT_TOKEN=123456:ABCDEFGHIJK...
+   TELEGRAM_CHAT_ID=987654321
+   PUBLIC_DOMAIN=my-app.up.railway.app
+   OWNER_USER_ID=YOUR_USER_ID_DARI_STEP_0
+   ```
+
+3. **PENTING:** Kalau kamu set `OWNER_USER_ID`, redeploy bot!
+
+### Step 2: Test Bot
+1. Buka bot Telegram kamu
+2. Kirim `/start`
+3. Kalau berhasil: bot show greeting "Halo tod ! Aku bot downloader arvirmdn."
+
+**Kalau masih error:**
+- Cek Railway logs: `OWNER_USER_ID` sudah di-set?
+- Cek user ID-mu sudah bener?
+- Coba `/addmember YOUR_USER_ID` sebagai owner
+
+---
+
 ## ✨ Fitur Bot Telegram
 
 ### User Features (Member Only)
@@ -30,62 +62,36 @@ Kalau orang yang belum di-add coba kirim link:
 ❌ lu bukan member tod, member dulu sana ke admin gantenkk @asololeeeee
 ```
 
+---
+
 ## Environment Variables (Railway > Settings > Variables)
 
-**Required:**
+**REQUIRED (Membership System):**
+- `OWNER_USER_ID` — user_id Telegram kamu (pemilik bot, untuk admin commands)
+  - **WAJIB diset biar membership system berfungsi!**
+  - Bisa dapat dari @getmyid_bot
+
+**REQUIRED (Basic Config):**
 - `TELEGRAM_BOT_TOKEN` — token dari @BotFather
 - `TELEGRAM_CHAT_ID` — chat id pribadimu (notifikasi dari endpoint web)
-- `PUBLIC_DOMAIN` — domain publik Railway TANPA `https://`
-- `OWNER_USER_ID` — user_id Telegram kamu (pemilik bot, untuk admin commands)
+- `PUBLIC_DOMAIN` — domain publik Railway TANPA `https://` (contoh: `my-app.up.railway.app`)
 
-**Optional:**
+**OPTIONAL:**
 - `MAX_DURATION_MINUTES` (default `15`) — batas durasi video yang boleh diproses
 - `APPROVED_MEMBERS` — initial member list (format: `"123456,789012,345678"`) — komma-separated user IDs
   - Note: `OWNER_USER_ID` otomatis di-add, jadi nggak perlu dimasukkan di sini
 
-## Cara Setup
+---
 
-### 1. Deploy di Railway
-Pastikan struktur repo ini persis di root:
-```
-.
-├── app.py
-├── Procfile
-├── nixpacks.toml
-├── railway.toml
-├── requirements.txt
-└── README.md
-```
+## Cara Pakai sebagai Owner
 
-### 2. Set Environment Variables (Railway Console)
-Go to **Settings > Variables** dan isi:
-```
-TELEGRAM_BOT_TOKEN=123456:ABCDEFGHIJK...
-TELEGRAM_CHAT_ID=987654321
-PUBLIC_DOMAIN=my-app.up.railway.app
-OWNER_USER_ID=123456789
-MAX_DURATION_MINUTES=15
-APPROVED_MEMBERS=111111,222222,333333
-```
-
-### 3. Setup Webhook (Run Once)
-Setelah first deployment, buka di browser (replace dengan domain kamu):
+### Setup Webhook (Run Once Setelah Deploy)
+Setelah first deployment, buka di browser:
 ```
 https://my-app.up.railway.app/set-webhook
 ```
 
-Kalau berhasil, return: `{"ok": true, "result": true, "description": "Webhook was set"}`
-
-### 4. Test Bot
-1. Add bot di Telegram: `/start`
-2. Bot bakal reply dengan error membership (karena belum di-add)
-3. Pakai `/addmember` dari akun pemilik bot untuk add diri sendiri:
-   ```
-   /addmember 123456789
-   ```
-4. Coba `/start` lagi — sekarang harus bisa akses fitur downloader
-
-## Cara Pakai sebagai Owner
+Kalau berhasil, return: `{"ok": true, "result": true}`
 
 ### Lihat Member List
 ```
@@ -103,66 +109,62 @@ Kalau berhasil, return: `{"ok": true, "result": true, "description": "Webhook wa
 /removemember 987654321
 ```
 
-## Cara Dapetin User ID
+### Test Sendiri
+1. Kirim `/start` sebagai member
+2. Kirim link (contoh: YouTube URL)
+3. Pilih kualitas
+4. Bot proses & kirim video
 
-**Via Bot:**
-1. Add @userinfobot atau @getmyid_bot ke Telegram
-2. Forward pesan dari user target ke bot
-3. Bot bakal return user ID-nya
-
-**Via Bot Telegram Kamu:**
-Edit `app.py`, tambah ini di `handle_incoming_message()`:
-```python
-user_id = message.get("from", {}).get("id")
-send_bot_message(chat_id, f"Your user ID: `{user_id}`")
-```
-Kemudian user bisa ketik `/myid` untuk lihat ID mereka.
-
-## Catatan Teknis
-
-- **ffmpeg wajib ada di server** (untuk MP3 & audio dari Spotify) — diatur lewat
-  `nixpacks.toml` (`nixPkgs = ["...", "ffmpeg"]`) dan `railway.toml`
-  (`builder = "NIXPACKS"`). Pastikan KEDUA file ini ada persis di ROOT repo
-  (sejajar dengan `app.py`), bukan di dalam subfolder.
-- **Member list in-memory** — hilang kalau server restart. Kalau mau persistent,
-  perlu database (Redis, PostgreSQL, dll). Buat now, `APPROVED_MEMBERS` env var
-  bisa load initial list saat startup.
-- Fitur Spotify bergantung pada pencarian judul di YouTube — kualitas hasilnya
-  tergantung ada/tidaknya versi resmi/cocok di YouTube, bukan audio asli dari
-  Spotify (karena itu memang tidak mungkin diambil langsung).
-- Pilihan kualitas per-link & progress hook disimpan sementara di memori server
-  (bukan database) — kalau server restart pas user lagi mikir, dia perlu kirim
-  ulang linknya.
-- `yt-dlp` sengaja tidak dikunci versi di `requirements.txt`, biar selalu dapat
-  versi terbaru tiap redeploy.
-
-## Greeting Message
-
-Default greeting (untuk member):
-```
-👋 Halo tod ! Aku bot downloader arvirmdn.
-
-Kirim link dari:
-🎵 TikTok  ▶️ YouTube  📸 Instagram  📘 Facebook  🐦 Twitter
-🎧 Spotify ...
-```
-
-Bisa diedit langsung di `app.py` di function `handle_incoming_message()`.
+---
 
 ## Troubleshooting
 
-### Bot nggak reply
-1. Cek `TELEGRAM_BOT_TOKEN` valid
-2. Buka https://my-domain.up.railway.app/set-webhook lagi
-3. Check Railway logs untuk error
+### "lu bukan member tod" padahal aku owner?
+**PENYEBAB:** `OWNER_USER_ID` belum di-set atau salah
+
+**SOLUSI:**
+1. Cek user ID kamu pakai @getmyid_bot (harus angka)
+2. Set di Railway: `OWNER_USER_ID=123456789` (ganti dengan ID kamu)
+3. **REDEPLOY** bot
+4. Kirim `/start` lagi
+
+### Bot nggak reply sama sekali
+1. Cek `TELEGRAM_BOT_TOKEN` valid di BotFather
+2. Buka https://my-domain.up.railway.app/set-webhook
+3. Check Railway Logs untuk error
 
 ### Orang add tapi tetep "bukan member"
-1. Pastikan `OWNER_USER_ID` di Railway settings udah set dengan user_id pemilik bot
-2. Cek di `/members` command apakah user ID-nya udah muncul
+1. Pastikan user ID target bener (pakai @getmyid_bot)
+2. Kirim `/members` untuk verifikasi user ID-nya muncul
+3. Kalau nggak muncul, coba `/addmember` lagi
 
 ### Member list hilang saat restart
 1. Set `APPROVED_MEMBERS` env var dengan initial list (comma-separated)
-2. Atau wait for database integration di next iteration
+   Contoh: `APPROVED_MEMBERS=111111,222222,333333`
+2. Atau: add members lagi via `/addmember` command
+
+---
+
+## Catatan Teknis
+
+- **ffmpeg wajib ada di server** — diatur lewat `nixpacks.toml` dan `railway.toml`
+- **Member list in-memory** — kalau mau persistent across restart, perlu database (Redis/PostgreSQL)
+- Fitur Spotify tergantung pencarian YouTube — kualitas tergantung ada versi di YouTube atau nggak
+- Pilihan kualitas hilang kalau server restart (need database)
+- `yt-dlp` tidak dikunci versi, selalu dapat versi terbaru saat redeploy
+
+---
+
+## Quick Setup Checklist
+
+- [ ] Get user ID dari @getmyid_bot
+- [ ] Set `OWNER_USER_ID` di Railway Variables
+- [ ] Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `PUBLIC_DOMAIN`
+- [ ] Redeploy
+- [ ] Buka `/set-webhook` di browser
+- [ ] Test `/start` di bot
+- [ ] Test download dengan link YouTube
+- [ ] Add member lain dengan `/addmember <id>`
 
 ---
 
