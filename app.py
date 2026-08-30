@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Query, HTTPException, Request, BackgroundTasks, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from urllib.parse import quote
@@ -436,6 +436,34 @@ def extract_video_url(info: dict, quality: int) -> str | None:
     return max(candidates, key=lambda f: f.get("height") or 0).get("url")
 
 
+def is_tiktok_photo_url(url: str) -> bool:
+    """Post foto/slide (carousel) TikTok pakai path /photo/<id> di URL-nya,
+    beda dari /video/<id> untuk video biasa — dipakai buat deteksi dini
+    sebelum extract_video_url() (yang memang tidak akan pernah nemu format
+    video di post foto, karena post foto beneran tidak punya stream video)."""
+    lower = url.lower()
+    return "tiktok.com" in lower and "/photo/" in lower
+
+
+def extract_tiktok_photos(info: dict) -> list[str]:
+    """Ambil daftar URL foto dari post TikTok mode foto/slide. yt-dlp versi
+    baru expose ini lewat key 'images' langsung di info dict; versi lebih
+    lama cuma taruh tiap foto sebagai 'format' tersendiri (vcodec='none',
+    ext gambar) di dalam 'formats', jadi kita fallback ke situ juga."""
+    photos: list[str] = []
+    for img in info.get("images") or []:
+        u = img.get("url") if isinstance(img, dict) else img
+        if u:
+            photos.append(u)
+    if photos:
+        return photos
+    image_exts = {"jpg", "jpeg", "png", "webp"}
+    for f in info.get("formats", []) or []:
+        if f.get("vcodec") == "none" and f.get("ext") in image_exts and f.get("url"):
+            photos.append(f["url"])
+    return photos
+
+
 def estimate_filesize_bytes(info: dict, quality: int | None = None) -> int | None:
     """Cari estimasi ukuran file dari metadata yt-dlp. yt-dlp kadang punya
     'filesize' (pasti) atau cuma 'filesize_approx' (perkiraan) tergantung platform.
@@ -605,6 +633,50 @@ def fetch_video_info(url: str, quality: int = 720):
         "quality": quality,
         "filesize_bytes": filesize_bytes,
         "filesize_label": format_filesize(filesize_bytes),
+    }, None
+
+
+def fetch_tiktok_photo_info(url: str):
+    """Versi khusus post TikTok mode foto/slide (carousel) — dipisah dari
+    fetch_video_info() karena post foto tidak punya stream video sama
+    sekali, jadi build_ydl_opts (yang mensyaratkan format video) tidak
+    relevan di sini."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 20,
+        "http_headers": {"User-Agent": USER_AGENT},
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        return None, f"Gagal memproses link: {e}"
+    except Exception as e:
+        return None, f"Terjadi kesalahan server: {e}"
+
+    photos = extract_tiktok_photos(info)
+    if not photos:
+        return None, "Tidak ada foto yang ditemukan pada postingan TikTok ini."
+
+    audio_url = None
+    audio_candidates = [
+        f for f in (info.get("formats") or [])
+        if f.get("url") and f.get("acodec") != "none" and f.get("vcodec") == "none"
+    ]
+    if audio_candidates:
+        audio_url = max(audio_candidates, key=lambda f: f.get("abr") or 0).get("url")
+
+    title = info.get("title") or info.get("description") or "TikTok Photo"
+    return {
+        "status": "success",
+        "type": "photo",
+        "title": title,
+        "photos": photos,
+        "photo_count": len(photos),
+        "audio_url": audio_url,
+        "thumbnail": photos[0],
+        "platform": "tiktok",
     }, None
 
 
@@ -812,6 +884,29 @@ def send_bot_video_file(chat_id, filepath: str, title: str, platform: str, quali
         return False
 
 
+def send_bot_photo_album(chat_id, photo_urls: list[str], title: str) -> bool:
+    """Kirim beberapa foto sekaligus sebagai album via sendMediaGroup.
+    Telegram membatasi maks 10 media per pemanggilan, jadi di-chunk kalau
+    postingannya lebih dari 10 foto (caption cuma ditaruh di foto pertama
+    biar tidak dobel)."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    caption = f"🖼️ {title}"[:1024]
+    any_ok = False
+    for i in range(0, len(photo_urls), 10):
+        chunk = photo_urls[i:i + 10]
+        media = []
+        for j, u in enumerate(chunk):
+            item = {"type": "photo", "media": u}
+            if i == 0 and j == 0:
+                item["caption"] = caption
+            media.append(item)
+        resp = tg_call("sendMediaGroup", {"chat_id": chat_id, "media": media})
+        if resp and resp.get("ok"):
+            any_ok = True
+    return any_ok
+
+
 def send_bot_audio_file(chat_id, filepath: str, title: str, platform: str) -> bool:
     if not TELEGRAM_BOT_TOKEN:
         return False
@@ -867,6 +962,9 @@ async def root():
             "/proxy?source=...&quality=720",
             "/download-audio?url=...",
             "/proxy-audio?source=...",
+            "/download-photo?url=... (TikTok foto/slide)",
+            "/proxy-image?source=...&filename=... (TikTok foto/slide)",
+            "/download-photos-zip (POST, body: {url}) (TikTok foto/slide)",
             "/playlist-info?url=... (YouTube playlist)",
             "/download-zip (POST, body: [{url, quality}])",
             "/health",
@@ -910,6 +1008,98 @@ async def playlist_info(request: Request, url: str = Query(...)):
         record_error_event(error)
         raise HTTPException(status_code=422, detail=error)
     return result
+
+
+@app.get("/download-photo")
+async def download_photo(request: Request, url: str = Query(...)):
+    """Khusus post TikTok mode foto/slide (carousel) — balikin daftar URL
+    foto (bukan satu file video), dipakai frontend saat link terdeteksi
+    /photo/ di URL TikTok-nya."""
+    check_web_origin(request)
+    check_rate_limit(request)
+    result, error = fetch_tiktok_photo_info(url)
+    if error:
+        record_error_event(error)
+        send_telegram_notification(f"❌ *Gagal Memproses Foto TikTok!*\n• URL: {url}\n• Error: `{error}`")
+        status_code = 404 if "Tidak ada" in error else 422
+        raise HTTPException(status_code=status_code, detail=error)
+
+    send_telegram_notification(
+        f"🖼️ *Unduhan Foto TikTok Berhasil!*\n• Judul: {result['title']}\n"
+        f"• Jumlah foto: {result['photo_count']}\n• URL: {url}"
+    )
+    return result
+
+
+@app.get("/proxy-image")
+async def proxy_image(request: Request, source: str = Query(...), filename: str = Query("photo.jpg")):
+    """Stream 1 foto TikTok lewat server kita, biar tombol Download di web
+    beneran men-trigger unduhan file (bukan cuma buka tab baru) dan supaya
+    permintaan tetap kebawa header Referer yang benar ke CDN TikTok."""
+    check_web_origin(request)
+    check_rate_limit(request)
+    try:
+        resp = requests.get(
+            source,
+            headers={"User-Agent": USER_AGENT, "Referer": "https://www.tiktok.com/"},
+            timeout=30,
+            stream=True,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        record_error_event(str(e))
+        raise HTTPException(status_code=502, detail=f"Gagal mengunduh foto: {e}")
+
+    return StreamingResponse(
+        resp.iter_content(chunk_size=65536),
+        media_type=resp.headers.get("content-type", "image/jpeg"),
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+class PhotoZipRequest(BaseModel):
+    url: str
+
+
+@app.post("/download-photos-zip")
+async def download_photos_zip(request: Request, body: PhotoZipRequest = Body(...)):
+    """Bungkus semua foto dari 1 post TikTok foto/slide jadi satu file .zip."""
+    check_web_origin(request)
+    check_rate_limit(request)
+
+    result, error = fetch_tiktok_photo_info(body.url)
+    if error:
+        record_error_event(error)
+        raise HTTPException(status_code=404 if "Tidak ada" in error else 422, detail=error)
+
+    zip_tmp_dir = tempfile.mkdtemp(prefix="photozip_")
+    zip_path = os.path.join(zip_tmp_dir, "photos.zip")
+    base_name = sanitize_filename(result["title"])
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, photo_url in enumerate(result["photos"], start=1):
+                try:
+                    r = requests.get(
+                        photo_url,
+                        headers={"User-Agent": USER_AGENT, "Referer": "https://www.tiktok.com/"},
+                        timeout=30,
+                    )
+                    r.raise_for_status()
+                    zf.writestr(f"{base_name}-{i}.jpg", r.content)
+                except Exception as e:
+                    zf.writestr(f"GAGAL-{i}.txt", f"Gagal mengunduh foto {i}: {e}")
+    except Exception as e:
+        shutil.rmtree(zip_tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=502, detail=f"Gagal membuat ZIP foto: {e}")
+
+    send_telegram_notification(
+        f"🗜️ *Unduhan ZIP Foto TikTok*\n• Judul: {result['title']}\n• Jumlah: {result['photo_count']}"
+    )
+
+    return FileResponse(
+        zip_path, media_type="application/zip", filename=f"{base_name}.zip",
+        background=BackgroundTask(lambda: shutil.rmtree(zip_tmp_dir, ignore_errors=True)),
+    )
 
 
 @app.get("/proxy")
@@ -1189,12 +1379,41 @@ def process_and_deliver(chat_id, url: str, quality: int, audio_only: bool, statu
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def process_tiktok_photo(chat_id, url: str, status_message_id: int | None = None) -> bool:
+    if status_message_id:
+        edit_bot_message(chat_id, status_message_id, "🖼️ Mengambil foto-foto TikTok...")
+    else:
+        status_message_id = send_bot_message(chat_id, "🖼️ Mengambil foto-foto TikTok...")
+
+    result, error = fetch_tiktok_photo_info(url)
+    if error:
+        text = f"❌ Gagal memproses link:\n{error}"
+        if status_message_id:
+            edit_bot_message(chat_id, status_message_id, text)
+        else:
+            send_bot_message(chat_id, text)
+        return False
+
+    esc_title = md_escape(result["title"])
+    photos = result["photos"]
+    edit_bot_message(chat_id, status_message_id, f"📤 Mengirim {len(photos)} foto...\n*{esc_title}*")
+
+    ok = send_bot_photo_album(chat_id, photos, result["title"])
+    delete_bot_message(chat_id, status_message_id)
+
+    if not ok:
+        send_bot_message(chat_id, f"⚠️ Gagal mengirim foto untuk *{esc_title}*, coba lagi beberapa saat lagi.")
+    return ok
+
+
 def process_link(chat_id, url: str, quality: int = 720, audio_only: bool = False, status_message_id: int | None = None) -> bool:
     # Dihitung untuk /stats. Ini menghitung "link yang diproses" (bukan jaminan
     # berhasil terkirim), tapi cukup untuk gambaran kasar seberapa aktif bot dipakai.
     db_increment_stat("bot_links_processed")
     if is_spotify(url):
         return process_spotify(chat_id, url, status_message_id)
+    elif is_tiktok_photo_url(url):
+        return process_tiktok_photo(chat_id, url, status_message_id)
     else:
         return process_and_deliver(chat_id, url, quality, audio_only, status_message_id)
 
@@ -1353,11 +1572,12 @@ def handle_incoming_message(message: dict):
                 chat_id,
                 "👋 *Halo tod ! Aku bot downloader arvirmdn.*\n\n"
                 "Kirim link dari:\n"
-                "🎵 TikTok  ▶️ YouTube  📸 Instagram  📘 Facebook  🐦 Twitter\n"
+                "🎵 TikTok (video & foto/slide)  ▶️ YouTube  📸 Instagram  📘 Facebook  🐦 Twitter\n"
                 "🎧 Spotify _(otomatis dicari versi audionya di YouTube, karena Spotify tidak menyediakan unduhan langsung)_\n\n"
                 "*Cara pakai:*\n"
-                "• Kirim 1 link → aku tanya dulu mau kualitas / format apa\n"
-                f"• Kirim beberapa link sekaligus (maks {MAX_LINKS_PER_MESSAGE}) → langsung diproses semua di 720p\n\n"
+                "• Kirim 1 link video → aku tanya dulu mau kualitas / format apa\n"
+                "• Kirim 1 link foto/slide TikTok → langsung diproses & dikirim sebagai album foto\n"
+                f"• Kirim beberapa link sekaligus (maks {MAX_LINKS_PER_MESSAGE}) → langsung diproses semua (video di 720p, foto TikTok otomatis terdeteksi)\n\n"
                 f"⚠️ Video di atas {MAX_DURATION_MINUTES} menit atau {TELEGRAM_MAX_UPLOAD_MB}MB akan dikasih link download "
                 "(bukan dikirim langsung), karena itu batas dari Telegram sendiri."
             )
@@ -1384,6 +1604,9 @@ def handle_incoming_message(message: dict):
     if len(urls) == 1:
         url = urls[0]
         if is_spotify(url):
+            process_link(chat_id, url)
+            return
+        if is_tiktok_photo_url(url):
             process_link(chat_id, url)
             return
         req_id = pending_add(url)
