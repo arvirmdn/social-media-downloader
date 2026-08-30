@@ -1,7 +1,8 @@
-from fastapi import FastAPI, Query, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, Query, HTTPException, Request, BackgroundTasks, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from starlette.background import BackgroundTask
+from pydantic import BaseModel
 from urllib.parse import quote
 import yt_dlp
 import os
@@ -13,6 +14,7 @@ import tempfile
 import time
 import uuid
 import requests
+import zipfile
 
 app = FastAPI(title="Social Media Downloader API")
 
@@ -645,6 +647,7 @@ async def root():
             "/proxy?source=...&quality=720",
             "/download-audio?url=...",
             "/proxy-audio?source=...",
+            "/download-zip (POST, body: [{url, quality}])",
             "/health",
             "/telegram-webhook (POST)",
         ],
@@ -717,6 +720,94 @@ async def proxy_download_audio(request: Request, source: str = Query(...), filen
     return FileResponse(
         filepath, media_type="audio/mpeg", filename=filename,
         background=BackgroundTask(lambda: shutil.rmtree(tmp_dir, ignore_errors=True)),
+    )
+
+
+# ---------- Batch ZIP download (web) ----------
+
+class ZipItem(BaseModel):
+    url: str
+    quality: str = "720"  # "360" / "720" / "1080" / "1440" / "2160" / "mp3"
+
+
+@app.post("/download-zip")
+async def download_zip(request: Request, items: list[ZipItem] = Body(...)):
+    """Unduh beberapa link sekaligus (maks MAX_LINKS_PER_MESSAGE) dan bungkus
+    jadi satu file .zip. Item yang gagal tidak menggagalkan seluruh proses —
+    statusnya dicatat di manifest.txt di dalam ZIP-nya."""
+    check_web_origin(request)
+    check_rate_limit(request)
+
+    if not items:
+        raise HTTPException(status_code=400, detail="Tidak ada link yang dikirim.")
+    items = items[:MAX_LINKS_PER_MESSAGE]
+
+    zip_tmp_dir = tempfile.mkdtemp(prefix="zip_")
+    zip_path = os.path.join(zip_tmp_dir, "downloads.zip")
+    cleanup_dirs = [zip_tmp_dir]
+    manifest_lines = []
+    used_names: set[str] = set()
+
+    def unique_arcname(base: str) -> str:
+        name = base
+        i = 2
+        while name in used_names:
+            root, ext = os.path.splitext(base)
+            name = f"{root} ({i}){ext}"
+            i += 1
+        used_names.add(name)
+        return name
+
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for idx, item in enumerate(items, start=1):
+                url = item.url.strip()
+                quality = (item.quality or "720").strip().lower()
+                try:
+                    if is_spotify(url) or quality == "mp3":
+                        info, error = fetch_audio_info(url)
+                        if error:
+                            manifest_lines.append(f"[GAGAL] {url} — {error}")
+                            continue
+                        source = f"ytsearch1:{info['title']} audio" if is_spotify(url) else url
+                        filepath, tmp_dir = download_audio_file(source)
+                    else:
+                        try:
+                            q = int(quality)
+                        except ValueError:
+                            q = 720
+                        info, error = fetch_video_info(url, q)
+                        if error:
+                            manifest_lines.append(f"[GAGAL] {url} — {error}")
+                            continue
+                        filepath, tmp_dir = download_video_file(url, q)
+
+                    cleanup_dirs.append(tmp_dir)
+                    ext = os.path.splitext(filepath)[1]
+                    safe_name = unique_arcname(sanitize_filename(info["title"]) + ext)
+                    zf.write(filepath, arcname=safe_name)
+                    manifest_lines.append(f"[OK] {safe_name}")
+                except Exception as e:
+                    manifest_lines.append(f"[GAGAL] {url} — {e}")
+
+            zf.writestr("manifest.txt", "\n".join(manifest_lines))
+    except Exception as e:
+        for d in cleanup_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+        raise HTTPException(status_code=502, detail=f"Gagal membuat ZIP: {e}")
+
+    ok_count = sum(1 for l in manifest_lines if l.startswith("[OK]"))
+    send_telegram_notification(
+        f"🗜️ *Unduhan ZIP (Web)*\n• Berhasil: {ok_count}/{len(items)} link"
+    )
+
+    def cleanup_all():
+        for d in cleanup_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+    return FileResponse(
+        zip_path, media_type="application/zip", filename="downloads.zip",
+        background=BackgroundTask(cleanup_all),
     )
 
 
