@@ -2,14 +2,34 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import yt_dlp
+import os
+import requests
 
 app = FastAPI(title="Social Media Downloader API")
 
-# WAJIB: tanpa ini, fetch() dari browser (Blogspot) selalu diblok CORS
-# meskipun API-nya hidup dan responsnya benar.
+# Konfigurasi Telegram Bot (Ambil dari Environment Variable Railway atau isi langsung)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "MASUKKAN_BOT_TOKEN_ANDA")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "MASUKKAN_CHAT_ID_ANDA")
+
+def send_telegram_notification(message: str):
+    """Fungsi pembantu untuk mengirim pesan ke Telegram Bot"""
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "MASUKKAN_BOT_TOKEN_ANDA":
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        print(f"Gagal mengirim notifikasi Telegram: {e}")
+
+# WAJIB: tanpa ini, fetch() dari browser selalu diblok CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # ganti ke ["https://namablog.blogspot.com"] kalau mau dibatasi
+    allow_origins=["*"],
     allow_methods=["GET"],
     allow_headers=["*"],
 )
@@ -24,8 +44,6 @@ def build_ydl_opts(quality: int) -> dict:
         "format": f"best[height<={quality}]/best",
         "noplaylist": True,
         "socket_timeout": 20,
-        # membantu mengurangi "Sign in to confirm you're not a bot" dari YouTube
-        # di sebagian kasus — bukan jaminan 100%, tapi cukup membantu.
         "extractor_args": {
             "youtube": {"player_client": ["android", "web"]},
         },
@@ -80,21 +98,32 @@ async def download_video(
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=422, detail=f"Gagal memproses link: {str(e)}")
+        error_msg = str(e)
+        send_telegram_notification(f"❌ *Gagal Memproses Link!*\n• URL: {url}\n• Error: `{error_msg}`")
+        raise HTTPException(status_code=422, detail=f"Gagal memproses link: {error_msg}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Terjadi kesalahan server: {str(e)}")
+        error_msg = str(e)
+        send_telegram_notification(f"⚠️ *Kesalahan Server (Internal Error)*\n• URL: {url}\n• Error: `{error_msg}`")
+        raise HTTPException(status_code=500, detail=f"Terjadi kesalahan server: {error_msg}")
 
     video_url = extract_video_url(info, quality)
     if not video_url:
+        send_telegram_notification(f"⚠️ *Format Tidak Ditemukan*\n• URL: {url}\n• Kualitas: {quality}p")
         raise HTTPException(status_code=404, detail="Tidak ada format video yang cocok ditemukan untuk kualitas ini.")
+
+    title = info.get("title", "Video")
+    platform = info.get("extractor", "unknown")
+
+    # Kirim notifikasi sukses ke Telegram
+    send_telegram_notification(f"📥 *Unduhan Berhasil!*\n• Judul: {title}\n• Platform: {platform.upper()}\n• Kualitas: {quality}p\n• URL: {url}")
 
     return {
         "status": "success",
-        "title": info.get("title", "Video"),
+        "title": title,
         "video_url": video_url,
         "thumbnail": info.get("thumbnail", ""),
         "duration": info.get("duration", 0),
-        "platform": info.get("extractor", "unknown"),
+        "platform": platform,
         "quality": quality,
     }
 
