@@ -185,20 +185,6 @@ app.add_middleware(
 
 ALLOWED_QUALITIES = [144, 240, 360, 480, 720, 1080, 1440, 2160]
 
-# ---------- Konfigurasi fitur "Status WA HD" ----------
-# Video status WhatsApp otomatis dikompres ulang sama WA sendiri saat diupload,
-# dan itu yang bikin hasilnya burik walau file aslinya sudah bagus. Trik yang
-# dipakai di sini: video di-encode ULANG dulu di server pakai setting (resolusi,
-# bitrate, profile H.264) yang sudah mendekati/ berada di bawah ambang batas
-# kompresi WA, sehingga saat WA "mengompres ulang" hasilnya nyaris tidak
-# berubah lagi. ⚠️ Ini best-effort berdasarkan kebiasaan kompresi WA saat ini,
-# BUKAN jaminan mutlak — algoritma kompresi WA bisa berubah kapan saja.
-ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".3gp"}
-MAX_STATUS_UPLOAD_MB = int(os.getenv("MAX_STATUS_UPLOAD_MB", "150"))
-# Kalau auto_trim dimatikan user, tetap kasih batas atas durasi sumber biar
-# server nggak dipaksa encode video super panjang (mis. film utuh).
-MAX_STATUS_SOURCE_SECONDS = int(os.getenv("MAX_STATUS_SOURCE_SECONDS", "600"))  # 10 menit
-STATUS_HD_FFMPEG_TIMEOUT_SECONDS = int(os.getenv("STATUS_HD_FFMPEG_TIMEOUT_SECONDS", "300"))
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -825,58 +811,6 @@ def download_audio_file(source_url: str, progress_hook=None):
     return chosen[0], tmp_dir
 
 
-# ---------- Status WA HD (upload video user, re-encode di server) ----------
-
-def ffprobe_duration_seconds(path: str) -> float | None:
-    """Return durasi video dalam detik, atau None kalau file bukan video valid."""
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "csv=p=0",
-                path,
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        duration = float(result.stdout.strip())
-        return duration if duration > 0 else None
-    except Exception:
-        return None
-
-
-def convert_to_status_hd(input_path: str, output_path: str, trim_seconds: int | None = None):
-    """Re-encode video dengan setting yang diracik biar WA nggak perlu
-    mengompres ulang secara agresif saat diupload ke Status:
-    - Lebar dibatasi maks 720px (tinggi menyesuaikan, kelipatan 2) — status WA
-      toh ditampilkan nggak lebih besar dari itu di layar HP.
-    - H.264 profile "main" + CRF rendah (detail tetap tajam) tapi bitrate
-      di-cap (maxrate/bufsize) supaya file nggak digelembungkan sia-sia.
-    - Audio AAC 128kbps, +faststart supaya video langsung bisa diputar/
-      diupload tanpa perlu "moov atom" dipindah dulu.
-    """
-    cmd = ["ffmpeg", "-y", "-i", input_path]
-    if trim_seconds:
-        cmd += ["-t", str(trim_seconds)]
-    cmd += [
-        "-vf", "scale='min(720,iw)':-2:flags=lanczos",
-        "-c:v", "libx264",
-        "-profile:v", "main",
-        "-level", "4.0",
-        "-preset", "medium",
-        "-crf", "20",
-        "-maxrate", "1300k",
-        "-bufsize", "2600k",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-ar", "44100",
-        "-movflags", "+faststart",
-        output_path,
-    ]
-    subprocess.run(cmd, check=True, capture_output=True, timeout=STATUS_HD_FFMPEG_TIMEOUT_SECONDS)
-
-
 # ---------- Telegram low-level helpers ----------
 
 def tg_call(method: str, payload: dict):
@@ -1093,7 +1027,6 @@ async def root():
             "/download-photos-zip (POST, body: {url}) (TikTok foto/slide)",
             "/playlist-info?url=... (YouTube playlist)",
             "/download-zip (POST, body: [{url, quality}])",
-            "/status-hd (POST, form-data: file, query: auto_trim=true/false) — Status WA HD",
             "/health",
             "/telegram-webhook (POST)",
         ],
@@ -1370,99 +1303,6 @@ async def download_zip(request: Request, items: list[ZipItem] = Body(...)):
     return FileResponse(
         zip_path, media_type="application/zip", filename="downloads.zip",
         background=BackgroundTask(cleanup_all),
-    )
-
-
-@app.post("/status-hd")
-async def status_hd(request: Request, file: UploadFile = File(...), auto_trim: bool = Query(True)):
-    """Upload video dari HP/PC user → di-encode ulang di server dengan setting
-    yang diracik biar hasil forward ke Status WhatsApp nggak dikompres ulang
-    sampai burik (lihat catatan di ALLOWED_VIDEO_EXTENSIONS di atas).
-
-    auto_trim=True (default): video >30 detik otomatis dipotong ke 30 detik
-    pertama, sesuai batas maksimal 1 segmen Status WA. Set auto_trim=false
-    kalau mau full-length (tetap dibatasi MAX_STATUS_SOURCE_SECONDS)."""
-    check_web_origin(request)
-    check_rate_limit(request)
-
-    ext = os.path.splitext(file.filename or "")[1].lower()
-    if ext not in ALLOWED_VIDEO_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Format file tidak didukung. Gunakan salah satu: {', '.join(sorted(ALLOWED_VIDEO_EXTENSIONS))}",
-        )
-
-    tmp_dir = tempfile.mkdtemp(prefix="statushd_")
-    input_path = os.path.join(tmp_dir, f"input{ext}")
-    output_path = os.path.join(tmp_dir, "status_wa_hd.mp4")
-
-    size = 0
-    max_bytes = MAX_STATUS_UPLOAD_MB * 1024 * 1024
-    try:
-        with open(input_path, "wb") as f:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > max_bytes:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"File terlalu besar (maks {MAX_STATUS_UPLOAD_MB}MB).",
-                    )
-                f.write(chunk)
-    except HTTPException:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise
-    except Exception as e:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        record_error_event(f"status-hd upload: {e}")
-        raise HTTPException(status_code=400, detail="Gagal membaca file yang diupload.")
-
-    duration = ffprobe_duration_seconds(input_path)
-    if duration is None:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(status_code=422, detail="File bukan video yang valid atau rusak.")
-
-    trim_seconds = None
-    if auto_trim and duration > 30:
-        trim_seconds = 30
-    elif not auto_trim and duration > MAX_STATUS_SOURCE_SECONDS:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Video {int(duration)} detik terlalu panjang untuk diproses tanpa potong otomatis "
-                f"(maks {MAX_STATUS_SOURCE_SECONDS // 60} menit). Aktifkan opsi potong ke 30 detik pertama."
-            ),
-        )
-
-    try:
-        convert_to_status_hd(input_path, output_path, trim_seconds=trim_seconds)
-    except subprocess.CalledProcessError as e:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        record_error_event(f"status-hd ffmpeg gagal: {e}")
-        raise HTTPException(status_code=500, detail="Gagal memproses video di server.")
-    except subprocess.TimeoutExpired:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        record_error_event("status-hd ffmpeg timeout")
-        raise HTTPException(status_code=504, detail="Proses video terlalu lama dan dihentikan.")
-
-    if not os.path.exists(output_path):
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail="Video hasil konversi tidak ditemukan di server.")
-
-    send_telegram_notification(
-        f"📼 *Konversi Status WA HD (Web)*\n• Durasi asli: {int(duration)}s"
-        + (" (dipotong ke 30s)" if trim_seconds else "")
-    )
-
-    def cleanup():
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    return FileResponse(
-        output_path, media_type="video/mp4", filename="status_wa_hd.mp4",
-        background=BackgroundTask(cleanup),
     )
 
 
