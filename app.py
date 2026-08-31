@@ -5,6 +5,7 @@ from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from urllib.parse import quote
 import yt_dlp
+import asyncio
 import os
 import re
 import glob
@@ -23,6 +24,12 @@ app = FastAPI(title="Social Media Downloader API")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # notifikasi ke akun pribadimu (dari endpoint web)
 PUBLIC_DOMAIN = os.getenv("PUBLIC_DOMAIN") or os.getenv("RAILWAY_PUBLIC_DOMAIN") or ""
+
+# TELEGRAM_WEBHOOK_SECRET — opsional tapi SANGAT disarankan diisi.
+# Tanpa ini, siapa pun yang tahu URL /telegram-webhook kamu bisa kirim payload
+# palsu dan bikin bot ini bertingkah aneh (impersonate update Telegram).
+# Isi bebas (string acak panjang), lalu dipakai juga saat /set-webhook dipanggil.
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 
 # OWNER_USER_ID — WAJIB diset di Railway Settings > Variables
 # Bisa dapat dari @getmyid_bot atau @userinfobot
@@ -159,6 +166,11 @@ if OWNER_USER_ID > 0:
 else:
     print("⚠️  WARNING: OWNER_USER_ID tidak di-set! Set env var OWNER_USER_ID di Railway Settings > Variables")
     print("   Membership system DISABLED untuk sekarang (semua user bisa akses)")
+
+if not TELEGRAM_WEBHOOK_SECRET:
+    print("⚠️  WARNING: TELEGRAM_WEBHOOK_SECRET belum diset! Endpoint /telegram-webhook masih bisa")
+    print("   dipanggil siapa saja tanpa verifikasi. Set env var TELEGRAM_WEBHOOK_SECRET (string acak),")
+    print("   lalu panggil ulang /set-webhook.")
 
 if APPROVED_MEMBERS:
     print(f"✅ Approved members ({len(APPROVED_MEMBERS)}, dari DB: {DB_PATH}): {sorted(APPROVED_MEMBERS.keys())}")
@@ -945,6 +957,57 @@ def make_progress_hook(chat_id, message_id, base_text: str):
     return hook
 
 
+# ---------- Maintenance: cleanup tmp dir & sweep member kedaluwarsa ----------
+
+def cleanup_orphaned_tmp_dirs():
+    """Hapus folder temp bekas download yang nyangkut kalau server sebelumnya
+    crash/force-restart di tengah proses (jadi finally/BackgroundTask cleanup-nya
+    nggak sempat jalan). Aman dipanggil saat startup karena di titik ini belum
+    ada download yang sedang berjalan sama sekali."""
+    base = tempfile.gettempdir()
+    prefixes = ("dl_", "zip_", "photozip_")
+    removed = 0
+    for prefix in prefixes:
+        for path in glob.glob(os.path.join(base, f"{prefix}*")):
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+    if removed:
+        print(f"🧹 Startup cleanup: {removed} folder temp sisa sesi sebelumnya dihapus.")
+
+
+EXPIRED_MEMBER_SWEEP_INTERVAL_SECONDS = int(os.getenv("EXPIRED_MEMBER_SWEEP_INTERVAL_SECONDS", str(6 * 3600)))
+
+
+def sweep_expired_members():
+    """Hapus member yang expires_at-nya sudah lewat, walau dia nggak pernah
+    interaksi lagi ke bot (is_member() cuma cek expiry pas dipakai, jadi kalau
+    member itu diam aja, datanya nyangkut terus tanpa sweep ini)."""
+    now = time.time()
+    expired_ids = [uid for uid, exp in list(APPROVED_MEMBERS.items()) if exp is not None and now > exp]
+    for uid in expired_ids:
+        remove_member(uid)
+    if expired_ids:
+        print(f"🧹 Sweep member kedaluwarsa: {len(expired_ids)} dihapus -> {expired_ids}")
+        _notify_owner(f"🧹 *Sweep otomatis*\n{len(expired_ids)} member kedaluwarsa sudah dihapus dari daftar.")
+
+
+async def expired_member_sweep_loop():
+    while True:
+        try:
+            sweep_expired_members()
+        except Exception as e:
+            print(f"⚠️  Sweep member kedaluwarsa gagal: {e}")
+        await asyncio.sleep(EXPIRED_MEMBER_SWEEP_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def on_startup():
+    cleanup_orphaned_tmp_dirs()
+    sweep_expired_members()  # sekali di awal, biar nggak nunggu interval pertama
+    asyncio.create_task(expired_member_sweep_loop())
+
+
 # ---------- Endpoint web (dipakai frontend Blogspot/Vercel) ----------
 
 @app.get("/")
@@ -1726,6 +1789,14 @@ def handle_callback_query(callback_query: dict):
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
+    # Verifikasi request ini beneran dari Telegram (bukan orang lain yang
+    # nembak endpoint ini langsung). Telegram selalu menyertakan header ini
+    # kalau secret_token di-set waktu setWebhook.
+    if TELEGRAM_WEBHOOK_SECRET:
+        incoming_secret = request.headers.get("x-telegram-bot-api-secret-token", "")
+        if incoming_secret != TELEGRAM_WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="Invalid webhook secret.")
+
     body = await request.json()
 
     # Proses beneran (download video/audio pakai yt-dlp+ffmpeg) bisa makan waktu lama.
@@ -1753,9 +1824,12 @@ async def set_webhook():
             detail="Set env var PUBLIC_DOMAIN dulu (isi domain Railway kamu, tanpa https://), lalu redeploy."
         )
     webhook_url = f"https://{PUBLIC_DOMAIN}/telegram-webhook"
+    params = {"url": webhook_url}
+    if TELEGRAM_WEBHOOK_SECRET:
+        params["secret_token"] = TELEGRAM_WEBHOOK_SECRET
     resp = requests.get(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
-        params={"url": webhook_url},
+        params=params,
         timeout=10,
     )
     return resp.json()
