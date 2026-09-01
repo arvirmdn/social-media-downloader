@@ -595,6 +595,63 @@ def fetch_playlist_entries(url: str):
     }, None
 
 
+MAX_MUSIC_SEARCH_RESULTS = int(os.getenv("MAX_MUSIC_SEARCH_RESULTS", "20"))
+
+
+def fetch_music_search(query: str, limit: int = 15):
+    """Cari lagu di YouTube pakai yt-dlp (ytsearchN:...), extract_flat biar
+    cepat (tidak resolve format/stream tiap video satu-satu, cukup untuk
+    ditampilkan sebagai daftar hasil pencarian). Stream/download beneran
+    baru terjadi saat user pencet Play/Download, lewat fetch_audio_info()
+    & download_audio_file() yang sudah ada (endpoint /download-audio &
+    /proxy-audio), dikasih URL video YouTube dari salah satu item hasil ini."""
+    query = (query or "").strip()
+    if not query:
+        return None, "Kata kunci pencarian tidak boleh kosong."
+    limit = max(1, min(limit or 15, MAX_MUSIC_SEARCH_RESULTS))
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "skip_download": True,
+        "socket_timeout": 20,
+        "http_headers": {"User-Agent": USER_AGENT},
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+    except yt_dlp.utils.DownloadError as e:
+        return None, f"Gagal mencari musik: {e}"
+    except Exception as e:
+        return None, f"Terjadi kesalahan server: {e}"
+
+    entries = [e for e in (info.get("entries") or []) if e]
+    items = []
+    for e in entries:
+        video_id = e.get("id")
+        if not video_id:
+            continue
+        thumb = e.get("thumbnail")
+        if not thumb:
+            thumbs = e.get("thumbnails") or []
+            thumb = thumbs[-1].get("url") if thumbs else None
+        if not thumb:
+            thumb = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+        items.append({
+            "title": e.get("title") or "Tanpa Judul",
+            "artist": e.get("uploader") or e.get("channel") or "",
+            "duration": e.get("duration") or 0,
+            "thumbnail": thumb,
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+        })
+
+    if not items:
+        return None, "Tidak ada hasil ditemukan untuk pencarian ini."
+
+    return {"status": "success", "query": query, "total": len(items), "items": items}, None
+
+
 def fetch_video_info(url: str, quality: int = 720):
     if quality not in ALLOWED_QUALITIES:
         quality = min(ALLOWED_QUALITIES, key=lambda q: abs(q - quality))
@@ -1022,6 +1079,7 @@ async def root():
             "/proxy?source=...&quality=720",
             "/download-audio?url=...",
             "/proxy-audio?source=...",
+            "/search-music?q=...&limit=15 (cari lagu YouTube untuk fitur Musik)",
             "/download-photo?url=... (TikTok foto/slide)",
             "/proxy-image?source=...&filename=... (TikTok foto/slide)",
             "/download-photos-zip (POST, body: {url}) (TikTok foto/slide)",
@@ -1067,6 +1125,22 @@ async def playlist_info(request: Request, url: str = Query(...)):
     if error:
         record_error_event(error)
         raise HTTPException(status_code=422, detail=error)
+    return result
+
+
+@app.get("/search-music")
+async def search_music(request: Request, q: str = Query(..., min_length=1), limit: int = Query(15)):
+    """Dipakai tab Musik di web: cari lagu di YouTube berdasarkan kata kunci
+    (judul/artis). Hasilnya cuma metadata ringan (judul, artis, durasi,
+    thumbnail, url) — belum ada stream/download link, itu baru diambil saat
+    user pencet Play atau Download lewat /download-audio & /proxy-audio."""
+    check_web_origin(request)
+    check_rate_limit(request)
+    result, error = fetch_music_search(q, limit)
+    if error:
+        record_error_event(error)
+        status_code = 404 if "Tidak ada hasil" in error else 422
+        raise HTTPException(status_code=status_code, detail=error)
     return result
 
 
